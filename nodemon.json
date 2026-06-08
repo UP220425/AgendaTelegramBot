@@ -1,0 +1,12 @@
+{
+  "watch": [
+    "src",
+    "package.json"
+  ],
+  "ext": "js,json",
+  "ignore": [
+    "data/*",
+    "docs/*",
+    "node_modules/*"
+  ]
+}

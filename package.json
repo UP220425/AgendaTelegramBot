@@ -1,0 +1,21 @@
+{
+  "name": "agenda-coordinacion-bot",
+  "version": "1.0.0",
+  "description": "MVP local de Agenda Coordinacion Bot para gestion de agenda interna.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.4.7",
+    "googleapis": "^173.0.0",
+    "node-cron": "^4.2.1",
+    "sharp": "^0.34.5",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
