@@ -45,6 +45,34 @@ const PEOPLE_ALIASES = {
       'yesica',
     ],
   },
+  citlali: {
+    standardName: 'Citlali',
+    aliases: [
+      'citlali',
+      'citla',
+      'citlaly',
+    ],
+  },
+  jacel: {
+    standardName: 'Jacel',
+    aliases: [
+      'jacel',
+    ],
+  },
+  ivan: {
+    standardName: 'Ivan',
+    aliases: [
+      'ivan',
+      'iván',
+    ],
+  },
+  mariana: {
+    standardName: 'Mariana',
+    aliases: [
+      'mariana',
+      'mari',
+    ],
+  },
   nestor: {
     standardName: 'Nestor',
     aliases: [

@@ -5,7 +5,9 @@ process.env.TZ = TIMEZONE;
 
 const fs = require('fs');
 const path = require('path');
-const { Telegraf, Markup, Input } = require('telegraf');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const { Telegraf, Markup } = require('telegraf');
 const dayjs = require('dayjs');
 const cron = require('node-cron');
 const {
@@ -20,6 +22,8 @@ const {
   parseAssignedPeople,
   parsePeopleQuery,
   parseTimeRange,
+  expandAvailabilityPeople,
+  getSchedulingPeopleForMeeting,
   getNextAgendaDate,
   getSource,
   isPersonInMeeting,
@@ -42,13 +46,16 @@ const {
 
 const BOT_NAME = 'Agenda Coordinación Bot';
 const SOURCE_NOTE = 'Fuente: datos de prueba.';
-const GENERATED_DIR = path.join(process.cwd(), 'data', 'generated');
+const DATA_DIR = path.join(process.cwd(), 'data');
+const GENERATED_DIR = path.join(DATA_DIR, 'generated');
+const SENT_REMINDERS_FILE = path.join(DATA_DIR, 'sentReminders.json');
 const {
   TELEGRAM_BOT_TOKEN,
   NODE_ENV = 'development',
   REMINDER_MINUTES_BEFORE = '15',
   DAILY_AGENDA_DIGEST_TIME = '17:00',
 } = process.env;
+const execFileAsync = promisify(execFile);
 
 let isBotRunning = false;
 let isCheckingReminders = false;
@@ -60,6 +67,11 @@ if (!TELEGRAM_BOT_TOKEN) {
 }
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+const AGENDA_IMAGE_FORMAT = 'jpeg';
+const AGENDA_IMAGE_EXTENSION = 'jpg';
+const TELEGRAM_UPLOAD_TIMEOUT_MS = 12000;
+const TELEGRAM_UPLOAD_CURL_TIMEOUT_SECONDS = Math.ceil(TELEGRAM_UPLOAD_TIMEOUT_MS / 1000);
+const REMINDER_GRACE_MINUTES = 1;
 
 const mainMenuMessage = [
   'Hola, soy Agenda Coordinación Bot.',
@@ -80,6 +92,7 @@ const helpMessage = [
   '- /empalmes manana: revisar conflictos del día siguiente',
   '- /agregar: iniciar alta de una nueva reunión',
   '- /baja: dar de baja una reunión',
+  '- /resumenhoy: generar imagen de agenda de hoy',
   '- /resumenmanana: probar el resumen automático del día siguiente',
 ].join('\n');
 
@@ -89,6 +102,10 @@ const AVAILABLE_PEOPLE = [
   { id: 'carlos_alberto', name: 'Carlos 2' },
   { id: 'leti', name: 'Lety' },
   { id: 'yess', name: 'Yess' },
+  { id: 'citlali', name: 'Citlali' },
+  { id: 'jacel', name: 'Jacel' },
+  { id: 'ivan', name: 'Ivan' },
+  { id: 'mariana', name: 'Mariana' },
   { id: 'nestor', name: 'Nestor' },
   { id: 'rodrigo', name: 'Rodrigo' },
   { id: 'paulina', name: 'Paulina' },
@@ -131,8 +148,9 @@ const availabilitySelections = new Map();
 const availabilityDateSelections = new Map();
 const addMeetingFlows = new Map();
 const deleteMeetingFlows = new Map();
-const sentReminderKeys = new Set();
+const sentReminderKeys = loadSentReminderKeys();
 const reminderMinutesBefore = Number(REMINDER_MINUTES_BEFORE) || 15;
+const reminderMinimumMinutesBefore = Math.max(reminderMinutesBefore - REMINDER_GRACE_MINUTES, 0);
 const dailyAgendaDigestTime = parseDailyDigestTime(DAILY_AGENDA_DIGEST_TIME);
 
 const ADD_MEETING_STEPS = {
@@ -142,7 +160,26 @@ const ADD_MEETING_STEPS = {
   NAME: 'name',
   ASSIGNED: 'assigned',
   LINK: 'link',
+  COLOR: 'color',
   CONFIRM: 'confirm',
+};
+const ADD_MEETING_WORKDAY_START_MINUTES = 7 * 60;
+const ADD_MEETING_WORKDAY_END_MINUTES = 18 * 60;
+const ADD_MEETING_TIME_STEP_MINUTES = 30;
+const ADD_MEETING_DURATION_OPTIONS = [30, 60, 90, 120];
+const ADD_MEETING_COLORS = {
+  white: {
+    label: 'Blanco',
+    value: 'white',
+  },
+  green: {
+    label: 'Verde claro',
+    value: 'green',
+  },
+  red: {
+    label: 'Rojo claro',
+    value: 'red',
+  },
 };
 
 function getCommandArgs(ctx, command) {
@@ -643,10 +680,14 @@ function addMeetingCancelKeyboard() {
   ]);
 }
 
-function addMeetingConfirmKeyboard() {
+function addMeetingDateKeyboard() {
   return Markup.inlineKeyboard([
     [
-      Markup.button.callback('Confirmar alta', 'agregar_confirmar'),
+      Markup.button.callback('Hoy', 'agregar_fecha:today'),
+      Markup.button.callback('Día siguiente', 'agregar_fecha:next'),
+    ],
+    [
+      Markup.button.callback('Elegir en calendario', 'agregar_calendario'),
     ],
     [
       Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
@@ -655,13 +696,253 @@ function addMeetingConfirmKeyboard() {
   ]);
 }
 
+function addMeetingCalendarKeyboard(monthDate = dayjs()) {
+  const safeMonth = dayjs.isDayjs(monthDate) && monthDate.isValid()
+    ? monthDate.startOf('month')
+    : dayjs().startOf('month');
+  const previousMonth = safeMonth.subtract(1, 'month').format('YYYY-MM');
+  const nextMonth = safeMonth.add(1, 'month').format('YYYY-MM');
+  const monthLabel = `${SPANISH_MONTHS[safeMonth.month()]} ${safeMonth.year()}`;
+  const weekdays = ['L', 'M', 'X', 'J', 'V', 'S', 'D'];
+  const rows = [
+    [
+      Markup.button.callback('<', `agregar_cal:${previousMonth}`),
+      Markup.button.callback(monthLabel, 'agregar_cal_noop'),
+      Markup.button.callback('>', `agregar_cal:${nextMonth}`),
+    ],
+    weekdays.map((day) => Markup.button.callback(day, 'agregar_cal_noop')),
+  ];
+  const daysInMonth = safeMonth.daysInMonth();
+  const firstDayOffset = (safeMonth.day() + 6) % 7;
+  let day = 1;
+
+  for (let week = 0; week < 6; week += 1) {
+    const row = [];
+
+    for (let weekday = 0; weekday < 7; weekday += 1) {
+      if ((week === 0 && weekday < firstDayOffset) || day > daysInMonth) {
+        row.push(Markup.button.callback('-', 'agregar_cal_noop'));
+        continue;
+      }
+
+      const date = safeMonth.date(day);
+      row.push(Markup.button.callback(String(day), `agregar_dia:${date.format('YYYY-MM-DD')}`));
+      day += 1;
+    }
+
+    rows.push(row);
+
+    if (day > daysInMonth) {
+      break;
+    }
+  }
+
+  rows.push([
+    Markup.button.callback('Hoy', 'agregar_fecha:today'),
+    Markup.button.callback('Día siguiente', 'agregar_fecha:next'),
+  ]);
+  rows.push([
+    Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+    Markup.button.callback('Volver al menú', 'menu_principal'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function addMeetingLinkKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('Sin link/comentarios', 'agregar_sin_link'),
+    ],
+    [
+      Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+      Markup.button.callback('Volver al menú', 'menu_principal'),
+    ],
+  ]);
+}
+
+function addMeetingColorKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('Blanco', 'agregar_color:white'),
+      Markup.button.callback('Verde claro', 'agregar_color:green'),
+    ],
+    [
+      Markup.button.callback('Rojo claro', 'agregar_color:red'),
+    ],
+    [
+      Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+      Markup.button.callback('Volver al menú', 'menu_principal'),
+    ],
+  ]);
+}
+
+function formatMeetingTimeFromMinutes(minutes) {
+  const safeMinutes = Math.max(0, Math.min(minutes, 23 * 60 + 59));
+  const hours24 = Math.floor(safeMinutes / 60);
+  const displayHour = hours24 % 12 || 12;
+  const displayMinutes = safeMinutes % 60;
+  const period = hours24 < 12 ? 'AM' : 'PM';
+
+  return `${displayHour}:${String(displayMinutes).padStart(2, '0')} ${period}`;
+}
+
+function formatMeetingTimeRangeFromMinutes(startMinutes, endMinutes) {
+  return [
+    formatMeetingTimeFromMinutes(startMinutes),
+    formatMeetingTimeFromMinutes(endMinutes),
+  ].join(' - ');
+}
+
+function formatDurationLabel(minutes) {
+  if (minutes === 30) {
+    return '30 min';
+  }
+
+  if (minutes % 60 === 0) {
+    return `${minutes / 60} h`;
+  }
+
+  return `${minutes / 60} h`;
+}
+
+function addMeetingTimeStartKeyboard() {
+  const rows = [];
+  const buttons = [];
+
+  for (
+    let minutes = ADD_MEETING_WORKDAY_START_MINUTES;
+    minutes < ADD_MEETING_WORKDAY_END_MINUTES;
+    minutes += ADD_MEETING_TIME_STEP_MINUTES
+  ) {
+    buttons.push(Markup.button.callback(
+      formatMeetingTimeFromMinutes(minutes),
+      `agregar_hora_inicio:${minutes}`
+    ));
+  }
+
+  for (let index = 0; index < buttons.length; index += 3) {
+    rows.push(buttons.slice(index, index + 3));
+  }
+
+  rows.push([
+    Markup.button.callback('Escribir horario manual', 'agregar_hora_manual'),
+  ]);
+  rows.push([
+    Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+    Markup.button.callback('Volver al menú', 'menu_principal'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function addMeetingDurationKeyboard(startMinutes) {
+  const durationButtons = ADD_MEETING_DURATION_OPTIONS
+    .filter((duration) => startMinutes + duration <= ADD_MEETING_WORKDAY_END_MINUTES)
+    .map((duration) => Markup.button.callback(
+      formatDurationLabel(duration),
+      `agregar_duracion:${startMinutes}:${duration}`
+    ));
+  const rows = [];
+
+  for (let index = 0; index < durationButtons.length; index += 2) {
+    rows.push(durationButtons.slice(index, index + 2));
+  }
+
+  rows.push([
+    Markup.button.callback('Cambiar inicio', 'agregar_hora_cambiar'),
+  ]);
+  rows.push([
+    Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+    Markup.button.callback('Volver al menú', 'menu_principal'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function addMeetingConfirmKeyboard(hasConflicts = false) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(hasConflicts ? 'Guardar de todos modos' : 'Confirmar alta', 'agregar_confirmar'),
+    ],
+    [
+      Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+      Markup.button.callback('Volver al menú', 'menu_principal'),
+    ],
+  ]);
+}
+
+function getAddMeetingSelectedPeople(flow) {
+  if (!flow.selectedPeople) {
+    flow.selectedPeople = new Set();
+  }
+
+  return flow.selectedPeople;
+}
+
+function addMeetingPeopleKeyboard(selectedPeople = new Set()) {
+  const rows = [];
+  const people = AVAILABLE_PEOPLE;
+
+  for (let index = 0; index < people.length; index += 2) {
+    const rowPeople = people.slice(index, index + 2);
+    rows.push(rowPeople.map((person) => {
+      const isSelected = selectedPeople.has(person.name);
+      const marker = isSelected ? '[x]' : '[ ]';
+      return Markup.button.callback(`${marker} ${person.name}`, `agregar_toggle:${person.id}`);
+    }));
+  }
+
+  rows.push([
+    Markup.button.callback('Listo con asignados', 'agregar_asignados_listo'),
+  ]);
+  rows.push([
+    Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
+    Markup.button.callback('Volver al menú', 'menu_principal'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function formatAddMeetingPeoplePrompt(flow) {
+  const selectedPeople = [...getAddMeetingSelectedPeople(flow)];
+
+  if (!selectedPeople.length) {
+    return [
+      'Selecciona las personas asignadas.',
+      '',
+      'También puedes escribirlas, por ejemplo:',
+      'Yess / Carlos 2 / Lety',
+    ].join('\n');
+  }
+
+  return [
+    'Personas seleccionadas:',
+    ...selectedPeople.map((person) => `- ${person}`),
+    '',
+    'Puedes seleccionar más o tocar Listo con asignados.',
+  ].join('\n');
+}
+
+function showAddMeetingPeopleMenu(ctx, flow = getActiveAddMeetingFlow(ctx)) {
+  if (!flow) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión activa.');
+  }
+
+  return sendOrEdit(
+    ctx,
+    formatAddMeetingPeoplePrompt(flow),
+    addMeetingPeopleKeyboard(getAddMeetingSelectedPeople(flow))
+  );
+}
+
 function getAddMeetingPrompt(step) {
   const prompts = {
     [ADD_MEETING_STEPS.DATE]: [
       'Vamos a agregar una reunión.',
       '',
-      'Escribe la fecha en formato YYYY-MM-DD.',
-      'Ejemplo: 2026-06-08',
+      'Elige una fecha o escribe una en formato YYYY-MM-DD.',
+      'También puedes escribir hoy o día siguiente.',
       '',
       'También puedes escribir cancelar.',
     ].join('\n'),
@@ -679,9 +960,21 @@ function getAddMeetingPrompt(step) {
       'Escribe el link o comentarios.',
       'Si no hay, escribe no.',
     ].join('\n'),
+    [ADD_MEETING_STEPS.COLOR]: [
+      'Elige el color de la fila.',
+      '',
+      'Blanco: reunión normal',
+      'Verde claro: tentativa o seguimiento especial',
+      'Rojo claro: importante o con atención',
+    ].join('\n'),
   };
 
   return prompts[step] || prompts[ADD_MEETING_STEPS.DATE];
+}
+
+function getAddMeetingColorLabel(value) {
+  const color = ADD_MEETING_COLORS[value] || ADD_MEETING_COLORS.white;
+  return color.label;
 }
 
 function parseMeetingDateInput(value) {
@@ -714,10 +1007,22 @@ function parseMeetingDateInput(value) {
   return parsedDate;
 }
 
+function formatAssignedPersonForAgenda(personName) {
+  return normalizePersonName(personName) === 'Lety'
+    ? 'Sra. Lety'
+    : personName;
+}
+
+function formatAssignedPeopleForAgenda(people = []) {
+  return people
+    .map(formatAssignedPersonForAgenda)
+    .join(' / ');
+}
+
 function formatAddMeetingSummary(data) {
   const normalizedPeople = parseAssignedPeople(data.asignadaA);
   const assignedText = normalizedPeople.length > 0
-    ? normalizedPeople.join(', ')
+    ? formatAssignedPeopleForAgenda(normalizedPeople)
     : data.asignadaA;
 
   return [
@@ -729,7 +1034,188 @@ function formatAddMeetingSummary(data) {
     `Reunión: ${data.nombreMeeting}`,
     `Asignados: ${assignedText}`,
     `Link / Comentarios: ${data.linkComentarios || 'Sin link/comentarios'}`,
+    `Color: ${getAddMeetingColorLabel(data.rowColor)}`,
   ].join('\n');
+}
+
+function hasTimeOverlap(firstRange, secondRange) {
+  return timeToMinutes(firstRange.start) < timeToMinutes(secondRange.end)
+    && timeToMinutes(firstRange.end) > timeToMinutes(secondRange.start);
+}
+
+function isValidForwardTimeRange(timeRange) {
+  return Boolean(
+    timeRange
+    && timeToMinutes(timeRange.start) < timeToMinutes(timeRange.end)
+  );
+}
+
+async function findAddMeetingConflicts(data) {
+  const timeRange = parseTimeRange(data.horaMexico);
+  const assignedPeople = expandAvailabilityPeople(parseAssignedPeople(data.asignadaA));
+
+  if (!isValidForwardTimeRange(timeRange) || assignedPeople.length === 0) {
+    return [];
+  }
+
+  const agenda = await getAgendaByDate(dayjs(data.date));
+
+  if (getSource(agenda) === 'mock') {
+    return [];
+  }
+
+  return agenda
+    .filter((meeting) => meeting.start && meeting.end)
+    .map((meeting) => {
+      const matchingPeople = getSchedulingPeopleForMeeting(meeting)
+        .filter((person) => assignedPeople.includes(person));
+
+      return {
+        meeting,
+        people: matchingPeople,
+      };
+    })
+    .filter((conflict) => (
+      conflict.people.length > 0
+      && hasTimeOverlap(timeRange, {
+        start: conflict.meeting.start,
+        end: conflict.meeting.end,
+      })
+    ));
+}
+
+function formatAddMeetingConflictWarning(conflicts) {
+  if (!conflicts.length) {
+    return '';
+  }
+
+  const lines = [
+    'Aviso de disponibilidad',
+    '',
+    'Este horario ya está ocupado para alguna de las personas asignadas:',
+    '',
+  ];
+
+  conflicts.slice(0, 6).forEach((conflict) => {
+    lines.push(`Personas ocupadas: ${conflict.people.join(', ')}`);
+    lines.push(formatMeetingShortBlock(conflict.meeting));
+    lines.push('');
+  });
+
+  if (conflicts.length > 6) {
+    lines.push(`Además hay ${conflicts.length - 6} empalme(s) más.`);
+    lines.push('');
+  }
+
+  lines.push('Puedes guardar de todos modos o cancelar el alta.');
+
+  return lines.join('\n').trim();
+}
+
+function formatAddMeetingReview(data, conflicts = []) {
+  const lines = [
+    formatAddMeetingSummary(data),
+  ];
+
+  if (conflicts.length > 0) {
+    lines.push('', formatAddMeetingConflictWarning(conflicts));
+  }
+
+  return lines.join('\n');
+}
+
+async function showAddMeetingReview(ctx, flow) {
+  flow.conflicts = await findAddMeetingConflicts(flow.data);
+
+  return sendOrEdit(
+    ctx,
+    formatAddMeetingReview(flow.data, flow.conflicts),
+    addMeetingConfirmKeyboard(flow.conflicts.length > 0)
+  );
+}
+
+function getMeetingDateText(meeting) {
+  return meeting.date || meeting.fecha || meeting.Fecha || '';
+}
+
+function getMeetingTimeText(meeting) {
+  return meeting.horaMexico || meeting['Hora Mexico'] || `${meeting.start || '??:??'} - ${meeting.end || '??:??'}`;
+}
+
+function getMeetingAssignedPeopleText(meeting) {
+  if (meeting.asignadaA) {
+    return meeting.asignadaA;
+  }
+
+  if (meeting['Asignada a']) {
+    return meeting['Asignada a'];
+  }
+
+  if (Array.isArray(meeting.personasAsignadas) && meeting.personasAsignadas.length > 0) {
+    return meeting.personasAsignadas.join(' / ');
+  }
+
+  return '';
+}
+
+function getMeetingPeopleForNotifications(meeting) {
+  const assignedPeople = Array.isArray(meeting.personasAsignadas) && meeting.personasAsignadas.length > 0
+    ? meeting.personasAsignadas
+    : parseAssignedPeople(getMeetingAssignedPeopleText(meeting));
+
+  return expandAvailabilityPeople(assignedPeople);
+}
+
+function formatMeetingChangeNotification(meeting, actionLabel) {
+  const lines = [
+    actionLabel,
+    '',
+    `Fecha: ${getMeetingDateText(meeting)}`,
+    `Horario: ${getMeetingTimeText(meeting)}`,
+    `Cliente: ${meeting.cliente || meeting.Cliente || 'Sin cliente'}`,
+    `Reunión: ${meeting.nombreMeeting || meeting['Nombre del meeting'] || 'Sin nombre'}`,
+    `Asignados: ${getMeetingAssignedPeopleText(meeting) || 'Sin asignar'}`,
+  ];
+
+  const linkComentarios = meeting.linkComentarios || meeting['Link / Comentarios'] || '';
+
+  if (linkComentarios) {
+    lines.push(`Link / Comentarios: ${linkComentarios}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function notifyRegisteredPeopleForMeeting(ctx, meeting, type) {
+  const targetPeople = getMeetingPeopleForNotifications(meeting);
+
+  if (!targetPeople.length) {
+    return 0;
+  }
+
+  const actionLabel = type === 'delete'
+    ? 'Se dio de baja una reunión de tu agenda.'
+    : 'Se agregó una reunión a tu agenda.';
+  const message = formatMeetingChangeNotification(meeting, actionLabel);
+  const profiles = getAllUserProfiles()
+    .filter((profile) => profile.chatId && profile.personName)
+    .filter((profile) => targetPeople.includes(normalizePersonName(profile.personName)));
+  let sentCount = 0;
+
+  for (const profile of profiles) {
+    try {
+      await bot.telegram.sendMessage(profile.chatId, message);
+      sentCount += 1;
+    } catch (error) {
+      console.error(`No pude enviar notificación a ${profile.personName}:`, getSafeErrorMessage(error));
+
+      if (shouldDeactivateSubscriber(error)) {
+        deactivateSubscriber(profile.chatId, getSafeErrorMessage(error));
+      }
+    }
+  }
+
+  return sentCount;
 }
 
 function startAddMeetingFlow(ctx) {
@@ -741,10 +1227,217 @@ function startAddMeetingFlow(ctx) {
 
   addMeetingFlows.set(userId, {
     step: ADD_MEETING_STEPS.DATE,
-    data: {},
+    data: {
+      rowColor: ADD_MEETING_COLORS.white.value,
+    },
+    selectedPeople: new Set(),
+    conflicts: [],
   });
 
-  return ctx.reply(getAddMeetingPrompt(ADD_MEETING_STEPS.DATE), addMeetingCancelKeyboard());
+  return ctx.reply(getAddMeetingPrompt(ADD_MEETING_STEPS.DATE), addMeetingDateKeyboard());
+}
+
+function getAddMeetingDateFromMode(mode) {
+  return mode === 'next' ? getNextAgendaDate() : dayjs();
+}
+
+function showAddMeetingCalendar(ctx, monthValue = dayjs()) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.DATE) {
+    return startAddMeetingFlow(ctx);
+  }
+
+  const parsedMonth = dayjs.isDayjs(monthValue)
+    ? monthValue
+    : dayjs(`${monthValue}-01`);
+  const safeMonth = parsedMonth.isValid() ? parsedMonth : dayjs();
+
+  return sendOrEdit(ctx, [
+    'Elige la fecha de la reunión:',
+    '',
+    `${SPANISH_MONTHS[safeMonth.month()]} ${safeMonth.year()}`,
+  ].join('\n'), addMeetingCalendarKeyboard(safeMonth));
+}
+
+function formatAddMeetingTimePrompt(flow) {
+  return [
+    'Elige la hora de inicio.',
+    '',
+    `Fecha: ${flow.data.date}`,
+    '',
+    'También puedes escribir el horario manualmente.',
+    'Ejemplo: 9:00 AM - 10:00 AM',
+  ].join('\n');
+}
+
+function showAddMeetingTimeMenu(ctx, flow = getActiveAddMeetingFlow(ctx)) {
+  if (!flow || flow.step !== ADD_MEETING_STEPS.TIME) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando horario.');
+  }
+
+  return sendOrEdit(
+    ctx,
+    formatAddMeetingTimePrompt(flow),
+    addMeetingTimeStartKeyboard()
+  );
+}
+
+function showAddMeetingManualTimePrompt(ctx) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.TIME) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando horario.');
+  }
+
+  return sendOrEdit(ctx, [
+    'Escribe el horario manualmente.',
+    '',
+    'Ejemplo: 9:00 AM - 10:00 AM',
+  ].join('\n'), addMeetingCancelKeyboard());
+}
+
+function showAddMeetingDurationMenu(ctx, startMinutes) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.TIME) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando horario.');
+  }
+
+  if (
+    !Number.isFinite(startMinutes)
+    || startMinutes < ADD_MEETING_WORKDAY_START_MINUTES
+    || startMinutes >= ADD_MEETING_WORKDAY_END_MINUTES
+  ) {
+    return showAddMeetingTimeMenu(ctx, flow);
+  }
+
+  return sendOrEdit(ctx, [
+    'Elige la duración.',
+    '',
+    `Inicio: ${formatMeetingTimeFromMinutes(startMinutes)}`,
+  ].join('\n'), addMeetingDurationKeyboard(startMinutes));
+}
+
+function setAddMeetingTimeRange(ctx, startMinutes, durationMinutes) {
+  const flow = getActiveAddMeetingFlow(ctx);
+  const endMinutes = startMinutes + durationMinutes;
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.TIME) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando horario.');
+  }
+
+  if (
+    !Number.isFinite(startMinutes)
+    || !Number.isFinite(durationMinutes)
+    || startMinutes < ADD_MEETING_WORKDAY_START_MINUTES
+    || endMinutes > ADD_MEETING_WORKDAY_END_MINUTES
+    || startMinutes >= endMinutes
+  ) {
+    return showAddMeetingTimeMenu(ctx, flow);
+  }
+
+  flow.data.horaMexico = formatMeetingTimeRangeFromMinutes(startMinutes, endMinutes);
+  flow.step = ADD_MEETING_STEPS.CLIENT;
+
+  return sendOrEdit(ctx, [
+    `Horario seleccionado: ${flow.data.horaMexico}`,
+    '',
+    getAddMeetingPrompt(flow.step),
+  ].join('\n'), addMeetingCancelKeyboard());
+}
+
+function setAddMeetingDateValue(ctx, date) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.DATE) {
+    return startAddMeetingFlow(ctx);
+  }
+
+  const safeDate = dayjs.isDayjs(date) ? date : dayjs(date);
+
+  if (!safeDate.isValid()) {
+    return showAddMeetingCalendar(ctx);
+  }
+
+  flow.data.date = safeDate.format('YYYY-MM-DD');
+  flow.step = ADD_MEETING_STEPS.TIME;
+
+  return showAddMeetingTimeMenu(ctx, flow);
+}
+
+function setAddMeetingDate(ctx, mode) {
+  return setAddMeetingDateValue(ctx, getAddMeetingDateFromMode(mode));
+}
+
+function toggleAddMeetingPerson(ctx, personId) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.ASSIGNED) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando asignados.');
+  }
+
+  const person = getPersonById(personId);
+
+  if (!person) {
+    return showAddMeetingPeopleMenu(ctx, flow);
+  }
+
+  const selectedPeople = getAddMeetingSelectedPeople(flow);
+
+  if (selectedPeople.has(person.name)) {
+    selectedPeople.delete(person.name);
+  } else {
+    selectedPeople.add(person.name);
+  }
+
+  return showAddMeetingPeopleMenu(ctx, flow);
+}
+
+function finishAddMeetingPeopleSelection(ctx) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.ASSIGNED) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando asignados.');
+  }
+
+  const selectedPeople = [...getAddMeetingSelectedPeople(flow)];
+
+  if (!selectedPeople.length) {
+    return showAddMeetingPeopleMenu(ctx, flow);
+  }
+
+  flow.data.asignadaA = formatAssignedPeopleForAgenda(selectedPeople);
+  flow.step = ADD_MEETING_STEPS.LINK;
+
+  return sendOrEdit(ctx, getAddMeetingPrompt(flow.step), addMeetingLinkKeyboard());
+}
+
+async function finishAddMeetingWithoutLink(ctx) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.LINK) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando link o comentarios.');
+  }
+
+  flow.data.linkComentarios = '';
+  flow.step = ADD_MEETING_STEPS.COLOR;
+
+  return sendOrEdit(ctx, getAddMeetingPrompt(flow.step), addMeetingColorKeyboard());
+}
+
+async function setAddMeetingColor(ctx, colorValue) {
+  const flow = getActiveAddMeetingFlow(ctx);
+
+  if (!flow || flow.step !== ADD_MEETING_STEPS.COLOR) {
+    return replyWithMenuButton(ctx, 'No encontré un alta de reunión esperando color.');
+  }
+
+  const color = ADD_MEETING_COLORS[colorValue] || ADD_MEETING_COLORS.white;
+  flow.data.rowColor = color.value;
+  flow.step = ADD_MEETING_STEPS.CONFIRM;
+
+  return showAddMeetingReview(ctx, flow);
 }
 
 async function handleAddMeetingText(ctx) {
@@ -770,20 +1463,28 @@ async function handleAddMeetingText(ctx) {
     const date = parseMeetingDateInput(text);
 
     if (!date) {
-      return ctx.reply('Fecha inválida. Usa formato YYYY-MM-DD.', addMeetingCancelKeyboard());
+      return ctx.reply('Fecha inválida. Usa formato YYYY-MM-DD o elige un botón.', addMeetingDateKeyboard());
     }
 
     flow.data.date = date.format('YYYY-MM-DD');
     flow.step = ADD_MEETING_STEPS.TIME;
-    return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingCancelKeyboard());
+    return showAddMeetingTimeMenu(ctx, flow);
   }
 
   if (flow.step === ADD_MEETING_STEPS.TIME) {
-    if (!parseTimeRange(text)) {
-      return ctx.reply('Horario inválido. Ejemplo válido: 9:00 AM - 10:00 AM', addMeetingCancelKeyboard());
+    const timeRange = parseTimeRange(text);
+
+    if (!isValidForwardTimeRange(timeRange)) {
+      return ctx.reply(
+        'Horario inválido. Elige una hora o escribe algo como: 9:00 AM - 10:00 AM',
+        addMeetingTimeStartKeyboard()
+      );
     }
 
-    flow.data.horaMexico = text;
+    flow.data.horaMexico = formatMeetingTimeRangeFromMinutes(
+      timeToMinutes(timeRange.start),
+      timeToMinutes(timeRange.end)
+    );
     flow.step = ADD_MEETING_STEPS.CLIENT;
     return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingCancelKeyboard());
   }
@@ -805,7 +1506,7 @@ async function handleAddMeetingText(ctx) {
 
     flow.data.nombreMeeting = text;
     flow.step = ADD_MEETING_STEPS.ASSIGNED;
-    return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingCancelKeyboard());
+    return showAddMeetingPeopleMenu(ctx, flow);
   }
 
   if (flow.step === ADD_MEETING_STEPS.ASSIGNED) {
@@ -815,18 +1516,35 @@ async function handleAddMeetingText(ctx) {
       return ctx.reply('Escribe al menos una persona asignada.', addMeetingCancelKeyboard());
     }
 
-    flow.data.asignadaA = text;
+    flow.data.asignadaA = formatAssignedPeopleForAgenda(assignedPeople);
+    flow.selectedPeople = new Set(assignedPeople);
     flow.step = ADD_MEETING_STEPS.LINK;
-    return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingCancelKeyboard());
+    return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingLinkKeyboard());
   }
 
   if (flow.step === ADD_MEETING_STEPS.LINK) {
     flow.data.linkComentarios = ['no', 'sin link', 'sin comentarios', '-'].includes(cleaned)
       ? ''
       : text;
-    flow.step = ADD_MEETING_STEPS.CONFIRM;
+    flow.step = ADD_MEETING_STEPS.COLOR;
 
-    return ctx.reply(formatAddMeetingSummary(flow.data), addMeetingConfirmKeyboard());
+    return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingColorKeyboard());
+  }
+
+  if (flow.step === ADD_MEETING_STEPS.COLOR) {
+    const colorByText = {
+      blanco: ADD_MEETING_COLORS.white.value,
+      white: ADD_MEETING_COLORS.white.value,
+      normal: ADD_MEETING_COLORS.white.value,
+      verde: ADD_MEETING_COLORS.green.value,
+      'verde claro': ADD_MEETING_COLORS.green.value,
+      green: ADD_MEETING_COLORS.green.value,
+      rojo: ADD_MEETING_COLORS.red.value,
+      'rojo claro': ADD_MEETING_COLORS.red.value,
+      red: ADD_MEETING_COLORS.red.value,
+    };
+
+    return setAddMeetingColor(ctx, colorByText[cleaned] || ADD_MEETING_COLORS.white.value);
   }
 
   return undefined;
@@ -840,11 +1558,25 @@ async function confirmAddMeeting(ctx) {
   }
 
   try {
+    const alreadyWarnedAboutConflicts = Array.isArray(flow.conflicts) && flow.conflicts.length > 0;
+    const latestConflicts = await findAddMeetingConflicts(flow.data);
+
+    if (latestConflicts.length > 0 && !alreadyWarnedAboutConflicts) {
+      flow.conflicts = latestConflicts;
+
+      return ctx.reply(
+        formatAddMeetingReview(flow.data, latestConflicts),
+        addMeetingConfirmKeyboard(true)
+      );
+    }
+
     await addMeetingRow(flow.data);
+    const notifiedCount = await notifyRegisteredPeopleForMeeting(ctx, flow.data, 'add');
     clearAddMeetingFlow(ctx);
 
     return replyWithMenuButton(ctx, [
       'Reunión agregada correctamente.',
+      `Notificaciones enviadas: ${notifiedCount}.`,
       '',
       formatAddMeetingSummary(flow.data),
     ].join('\n'));
@@ -1048,10 +1780,16 @@ async function confirmDeleteMeeting(ctx) {
       date: flow.target.iso,
       rowNumber: meeting.rowNumber,
     });
+    const notifiedCount = await notifyRegisteredPeopleForMeeting(ctx, {
+      ...meeting,
+      date: flow.target.iso,
+      asignadaA: meeting.asignadaA || formatAssignedPeople(meeting),
+    }, 'delete');
     clearDeleteMeetingFlow(ctx);
 
     return replyWithMenuButton(ctx, [
       'Reunión dada de baja correctamente.',
+      `Notificaciones enviadas: ${notifiedCount}.`,
       '',
       formatDeleteMeetingSummary(flow.target, meeting),
     ].join('\n'));
@@ -1159,6 +1897,61 @@ function wait(ms) {
   });
 }
 
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function readSentReminderStore() {
+  try {
+    if (!fs.existsSync(SENT_REMINDERS_FILE)) {
+      return {};
+    }
+
+    return JSON.parse(fs.readFileSync(SENT_REMINDERS_FILE, 'utf8') || '{}');
+  } catch (error) {
+    console.error('No pude leer recordatorios enviados; iniciaré memoria limpia:', getSafeErrorMessage(error));
+    return {};
+  }
+}
+
+function pruneSentReminderStore(store, currentDateKey) {
+  const minDate = dayjs(currentDateKey).subtract(7, 'day');
+
+  Object.keys(store).forEach((dateKey) => {
+    const parsedDate = dayjs(dateKey);
+
+    if (!parsedDate.isValid() || parsedDate.isBefore(minDate, 'day')) {
+      delete store[dateKey];
+    }
+  });
+
+  return store;
+}
+
+function loadSentReminderKeys() {
+  const todayKey = dayjs().format('YYYY-MM-DD');
+  const store = readSentReminderStore();
+  const todayKeys = Array.isArray(store[todayKey]) ? store[todayKey] : [];
+
+  return new Set(todayKeys);
+}
+
+function saveSentReminderKeys(dateKey) {
+  try {
+    ensureDataDir();
+
+    const store = pruneSentReminderStore(readSentReminderStore(), dateKey);
+    store[dateKey] = [...sentReminderKeys]
+      .filter((key) => key.includes(`|${dateKey}|`));
+
+    fs.writeFileSync(SENT_REMINDERS_FILE, `${JSON.stringify(store, null, 2)}\n`);
+  } catch (error) {
+    console.error('No pude guardar memoria de recordatorios:', getSafeErrorMessage(error));
+  }
+}
+
 function sanitizeLogMessage(value) {
   let message = String(value || '');
   const sensitiveValues = [
@@ -1186,6 +1979,8 @@ function isTransientNetworkError(error) {
   return message.includes('socket hang up')
     || message.includes('econnreset')
     || message.includes('etimedout')
+    || message.includes('timeout')
+    || message.includes('aborted')
     || message.includes('econnaborted')
     || message.includes('epipe')
     || message.includes('fetch failed')
@@ -1403,13 +2198,21 @@ function groupConflictsByPerson(conflicts) {
 }
 
 function getReminderKey(profile, meeting, dateKey) {
+  const profileKey = profile.chatId || profile.userId || profile.personName;
+  const meetingKey = meeting.rowNumber
+    ? `row:${meeting.rowNumber}`
+    : [
+      meeting.start,
+      meeting.end,
+      meeting.cliente,
+      meeting.nombreMeeting,
+    ].join(':');
+
   return [
-    profile.userId,
+    profileKey,
     dateKey,
+    meetingKey,
     meeting.start,
-    meeting.end,
-    meeting.cliente,
-    meeting.nombreMeeting,
   ].join('|');
 }
 
@@ -1454,7 +2257,10 @@ async function sendUpcomingMeetingReminders() {
         const startMinutes = timeToMinutes(meeting.start);
         const minutesUntilStart = startMinutes - nowMinutes;
 
-        if (minutesUntilStart < 0 || minutesUntilStart > reminderMinutesBefore) {
+        if (
+          minutesUntilStart < reminderMinimumMinutesBefore
+          || minutesUntilStart > reminderMinutesBefore
+        ) {
           continue;
         }
 
@@ -1465,6 +2271,7 @@ async function sendUpcomingMeetingReminders() {
         }
 
         sentReminderKeys.add(reminderKey);
+        saveSentReminderKeys(todayKey);
 
         await bot.telegram.sendMessage(
           profile.chatId,
@@ -1504,58 +2311,193 @@ function ensureGeneratedDir() {
   }
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) {
+    return 'tamano desconocido';
+  }
+
+  if (bytes < 1024) {
+    return `${bytes} bytes`;
+  }
+
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
 function getAgendaImagePath(digest) {
-  return path.join(GENERATED_DIR, `agenda-${digest.target.iso}.png`);
+  return path.join(GENERATED_DIR, `agenda-${digest.target.iso}.${AGENDA_IMAGE_EXTENSION}`);
 }
 
 async function writeAgendaImageFile(digest) {
   ensureGeneratedDir();
 
-  const imageBuffer = await createAgendaImageBuffer(digest.target.date, digest.agenda);
+  const imageBuffer = await createAgendaImageBuffer(digest.target.date, digest.agenda, {
+    format: AGENDA_IMAGE_FORMAT,
+  });
   const imagePath = getAgendaImagePath(digest);
+  const filename = path.basename(imagePath);
   fs.writeFileSync(imagePath, imageBuffer);
+  console.log(`Imagen de agenda generada (${digest.target.iso}): ${formatBytes(imageBuffer.length)}.`);
 
-  return imagePath;
+  return {
+    imageBuffer,
+    imagePath,
+    filename,
+    bytes: imageBuffer.length,
+  };
 }
 
-async function sendAgendaPhotoWithRetry(chatId, imagePath, caption = '') {
-  const maxAttempts = 3;
+function createTelegramApiUrl(method) {
+  return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+}
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      await bot.telegram.sendPhoto(chatId, Input.fromLocalFile(imagePath), {
-        caption,
-      });
+function createAbortTimeoutError(method) {
+  const error = new Error(`TELEGRAM_${method.toUpperCase()}_TIMEOUT`);
+  error.code = 'ETIMEDOUT';
+  return error;
+}
+
+function createTelegramApiError(method, data, status) {
+  const error = new Error(data?.description || `TELEGRAM_${method.toUpperCase()}_${status || 'ERROR'}`);
+  error.code = data?.error_code || status;
+  error.response = {
+    error_code: data?.error_code || status,
+    description: data?.description || error.message,
+  };
+
+  return error;
+}
+
+async function callTelegramMultipart(method, fields, file) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TELEGRAM_UPLOAD_TIMEOUT_MS);
+  const form = new FormData();
+
+  Object.entries(fields).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') {
       return;
-    } catch (error) {
-      if (shouldDeactivateSubscriber(error) || attempt === maxAttempts || !isTransientNetworkError(error)) {
-        throw error;
-      }
-
-      console.log(`Reintentando envío de imagen de agenda (${attempt + 1}/${maxAttempts}): ${getSafeErrorMessage(error)}`);
-      await wait(750 * attempt);
     }
+
+    form.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+  });
+
+  form.append(
+    file.fieldName,
+    new Blob([file.buffer], { type: file.contentType }),
+    file.filename
+  );
+
+  try {
+    const response = await fetch(createTelegramApiUrl(method), {
+      method: 'POST',
+      body: form,
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    let data;
+
+    try {
+      data = JSON.parse(responseText);
+    } catch (error) {
+      throw new Error(`TELEGRAM_${method.toUpperCase()}_INVALID_JSON_RESPONSE`);
+    }
+
+    if (!response.ok || !data.ok) {
+      throw createTelegramApiError(method, data, response.status);
+    }
+
+    return data.result;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw createAbortTimeoutError(method);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-async function sendAgendaDocumentWithRetry(chatId, imagePath, caption = '') {
-  const maxAttempts = 2;
+function getTelegramImageFile(image, fieldName) {
+  return {
+    fieldName,
+    buffer: image.imageBuffer,
+    path: image.imagePath,
+    filename: image.filename,
+    contentType: 'image/jpeg',
+  };
+}
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      await bot.telegram.sendDocument(chatId, Input.fromLocalFile(imagePath), {
-        caption,
-      });
+async function callTelegramMultipartWithCurl(method, fields, file) {
+  const args = [
+    '--silent',
+    '--show-error',
+    '--max-time',
+    String(TELEGRAM_UPLOAD_CURL_TIMEOUT_SECONDS),
+    createTelegramApiUrl(method),
+  ];
+
+  Object.entries(fields).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') {
       return;
-    } catch (error) {
-      if (shouldDeactivateSubscriber(error) || attempt === maxAttempts || !isTransientNetworkError(error)) {
-        throw error;
-      }
-
-      console.log(`Reintentando envío de documento de agenda (${attempt + 1}/${maxAttempts}): ${getSafeErrorMessage(error)}`);
-      await wait(750 * attempt);
     }
+
+    args.push('-F', `${key}=${typeof value === 'object' ? JSON.stringify(value) : String(value)}`);
+  });
+
+  args.push('-F', `${file.fieldName}=@${file.path};filename=${file.filename};type=${file.contentType}`);
+
+  try {
+    const { stdout } = await execFileAsync('curl', args, {
+      timeout: (TELEGRAM_UPLOAD_CURL_TIMEOUT_SECONDS + 3) * 1000,
+      maxBuffer: 1024 * 1024,
+    });
+    let data;
+
+    try {
+      data = JSON.parse(stdout);
+    } catch (error) {
+      throw new Error(`TELEGRAM_${method.toUpperCase()}_CURL_INVALID_JSON_RESPONSE`);
+    }
+
+    if (!data.ok) {
+      throw createTelegramApiError(method, data);
+    }
+
+    return data.result;
+  } catch (error) {
+    if (error.response) {
+      throw error;
+    }
+
+    throw new Error(getSafeErrorMessage(error.stderr || error.stdout || error.message || error));
   }
+}
+
+async function sendTelegramImage(method, chatId, image, caption, fieldName) {
+  const fields = {
+    chat_id: chatId,
+    caption,
+  };
+  const file = getTelegramImageFile(image, fieldName);
+
+  try {
+    return await callTelegramMultipart(method, fields, file);
+  } catch (error) {
+    if (shouldDeactivateSubscriber(error) || !isTransientNetworkError(error)) {
+      throw error;
+    }
+
+    console.log(`Upload directo falló para ${method}; intentando con curl: ${getSafeErrorMessage(error)}`);
+    return callTelegramMultipartWithCurl(method, fields, file);
+  }
+}
+
+async function sendAgendaPhotoWithRetry(chatId, image, caption = '') {
+  return sendTelegramImage('sendPhoto', chatId, image, caption, 'photo');
+}
+
+async function sendAgendaDocumentWithRetry(chatId, image, caption = '') {
+  return sendTelegramImage('sendDocument', chatId, image, caption, 'document');
 }
 
 async function replyLongMessage(ctx, message, extra = {}) {
@@ -1567,8 +2509,8 @@ async function replyLongMessage(ctx, message, extra = {}) {
   }
 }
 
-async function buildTomorrowAgendaDigest(options = {}) {
-  const target = buildDateTarget('next');
+async function buildAgendaDigest(mode, options = {}) {
+  const target = buildDateTarget(mode);
   const agenda = await getAgendaByDate(target.date, options);
 
   return {
@@ -1578,16 +2520,24 @@ async function buildTomorrowAgendaDigest(options = {}) {
   };
 }
 
+async function buildTodayAgendaDigest(options = {}) {
+  return buildAgendaDigest('today', options);
+}
+
+async function buildTomorrowAgendaDigest(options = {}) {
+  return buildAgendaDigest('next', options);
+}
+
 function formatAgendaDigestCaption(digest) {
   return `Agenda ${formatLongSpanishDate(digest.target.date)}`;
 }
 
 async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
-  let imagePath;
+  let image;
   const caption = formatAgendaDigestCaption(digest);
 
   try {
-    imagePath = await writeAgendaImageFile(digest);
+    image = await writeAgendaImageFile(digest);
   } catch (error) {
     console.error('No pude generar imagen de agenda; enviando texto:', getSafeErrorMessage(error));
     await sendLongTelegramMessage(chatId, digest.message, extra);
@@ -1595,7 +2545,7 @@ async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
   }
 
   try {
-    await sendAgendaPhotoWithRetry(chatId, imagePath, caption);
+    await sendAgendaPhotoWithRetry(chatId, image, caption);
   } catch (error) {
     if (shouldDeactivateSubscriber(error)) {
       throw error;
@@ -1604,7 +2554,7 @@ async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
     console.error('No pude enviar agenda como foto; intentando como documento:', getSafeErrorMessage(error));
 
     try {
-      await sendAgendaDocumentWithRetry(chatId, imagePath, caption);
+      await sendAgendaDocumentWithRetry(chatId, image, caption);
     } catch (documentError) {
       if (shouldDeactivateSubscriber(documentError)) {
         throw documentError;
@@ -1620,9 +2570,26 @@ async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
   }
 }
 
+async function replyAgendaDigest(ctx, buildDigest) {
+  const chatId = getChatId(ctx);
+
+  await ctx.reply('Generando imagen de agenda. En unos segundos te la mando.');
+
+  buildDigest()
+    .then((digest) => sendAgendaDigestToChat(chatId, digest, backToMenuKeyboard()))
+    .catch((error) => {
+      console.error('Error enviando resumen de agenda solicitado:', getSafeErrorMessage(error));
+    });
+
+  return undefined;
+}
+
+async function replyTodayAgendaDigest(ctx) {
+  return replyAgendaDigest(ctx, buildTodayAgendaDigest);
+}
+
 async function replyTomorrowAgendaDigest(ctx) {
-  const digest = await buildTomorrowAgendaDigest();
-  return sendAgendaDigestToChat(getChatId(ctx), digest, backToMenuKeyboard());
+  return replyAgendaDigest(ctx, buildTomorrowAgendaDigest);
 }
 
 async function sendDailyAgendaDigest() {
@@ -1748,6 +2715,10 @@ bot.command('manana', (ctx) => {
   return replyTomorrowAgenda(ctx);
 });
 
+bot.command('resumenhoy', (ctx) => {
+  return replyTodayAgendaDigest(ctx);
+});
+
 bot.command(['resumenmanana', 'resumendiasiguiente'], (ctx) => {
   return replyTomorrowAgendaDigest(ctx);
 });
@@ -1849,6 +2820,58 @@ bot.action(/^baja_fecha:(today|next)$/, async (ctx) => {
 bot.action(/^baja_select:(\d+)$/, async (ctx) => {
   await answerCallback(ctx);
   return selectDeleteMeeting(ctx, Number(ctx.match[1]));
+});
+bot.action(/^agregar_fecha:(today|next)$/, async (ctx) => {
+  await answerCallback(ctx);
+  return setAddMeetingDate(ctx, ctx.match[1]);
+});
+bot.action('agregar_calendario', async (ctx) => {
+  await answerCallback(ctx);
+  return showAddMeetingCalendar(ctx);
+});
+bot.action(/^agregar_cal:(\d{4}-\d{2})$/, async (ctx) => {
+  await answerCallback(ctx);
+  return showAddMeetingCalendar(ctx, ctx.match[1]);
+});
+bot.action(/^agregar_dia:(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
+  await answerCallback(ctx);
+  return setAddMeetingDateValue(ctx, dayjs(ctx.match[1]));
+});
+bot.action('agregar_cal_noop', async (ctx) => {
+  await answerCallback(ctx);
+  return undefined;
+});
+bot.action(/^agregar_hora_inicio:(\d+)$/, async (ctx) => {
+  await answerCallback(ctx);
+  return showAddMeetingDurationMenu(ctx, Number(ctx.match[1]));
+});
+bot.action(/^agregar_duracion:(\d+):(\d+)$/, async (ctx) => {
+  await answerCallback(ctx);
+  return setAddMeetingTimeRange(ctx, Number(ctx.match[1]), Number(ctx.match[2]));
+});
+bot.action('agregar_hora_manual', async (ctx) => {
+  await answerCallback(ctx);
+  return showAddMeetingManualTimePrompt(ctx);
+});
+bot.action('agregar_hora_cambiar', async (ctx) => {
+  await answerCallback(ctx);
+  return showAddMeetingTimeMenu(ctx);
+});
+bot.action(/^agregar_toggle:(.+)$/, async (ctx) => {
+  await answerCallback(ctx);
+  return toggleAddMeetingPerson(ctx, ctx.match[1]);
+});
+bot.action('agregar_asignados_listo', async (ctx) => {
+  await answerCallback(ctx);
+  return finishAddMeetingPeopleSelection(ctx);
+});
+bot.action('agregar_sin_link', async (ctx) => {
+  await answerCallback(ctx);
+  return finishAddMeetingWithoutLink(ctx);
+});
+bot.action(/^agregar_color:(white|green|red)$/, async (ctx) => {
+  await answerCallback(ctx);
+  return setAddMeetingColor(ctx, ctx.match[1]);
 });
 bot.action(/^disponibilidad_toggle:(.+)$/, async (ctx) => {
   await answerCallback(ctx);

@@ -36,6 +36,7 @@ const BORDER_COLOR = '#111111';
 const BLUE = '#1155cc';
 const WHITE = '#ffffff';
 const HIGHLIGHT = '#f4cccc';
+const DEFAULT_IMAGE_FORMAT = 'jpeg';
 
 const COLUMNS = [
   { key: 'fecha', label: 'Fecha', width: 150 },
@@ -86,6 +87,7 @@ function getMeetingRow(date, meeting) {
       ? meeting.personasAsignadas.join(' / ')
       : ''),
     link: meeting.linkComentarios || '',
+    rowBackground: meeting.rowBackground || '',
   };
 }
 
@@ -151,6 +153,26 @@ function shouldHighlightRow(row) {
   return /\byess\b|\byes\b|\byessica\b/i.test(row.asignadaA);
 }
 
+function normalizeHexColor(value) {
+  const color = String(value || '').trim();
+
+  if (!/^#[0-9a-f]{6}$/i.test(color)) {
+    return '';
+  }
+
+  return color.toLowerCase();
+}
+
+function getRowFill(row) {
+  const rowBackground = normalizeHexColor(row.rowBackground);
+
+  if (rowBackground) {
+    return rowBackground;
+  }
+
+  return shouldHighlightRow(row) ? HIGHLIGHT : WHITE;
+}
+
 function renderTableSvg(date, agenda = []) {
   const rows = agenda.map((meeting) => getMeetingRow(date, meeting));
   const rowHeights = rows.map(getRowHeight);
@@ -178,7 +200,7 @@ function renderTableSvg(date, agenda = []) {
   rows.forEach((row, rowIndex) => {
     currentX = 0;
     const rowHeight = rowHeights[rowIndex];
-    const fill = shouldHighlightRow(row) ? HIGHLIGHT : WHITE;
+    const fill = getRowFill(row);
 
     COLUMNS.forEach((column) => {
       const lines = wrapText(row[column.key], column.width, 22);
@@ -194,11 +216,23 @@ function renderTableSvg(date, agenda = []) {
   return parts.join('');
 }
 
-async function createAgendaImageBuffer(date, agenda = []) {
+async function createAgendaImageBuffer(date, agenda = [], options = {}) {
   const svg = renderTableSvg(date, agenda);
+  const format = options.format || DEFAULT_IMAGE_FORMAT;
+  const image = sharp(Buffer.from(svg)).flatten({ background: WHITE });
 
-  return sharp(Buffer.from(svg))
-    .png()
+  if (format === 'png') {
+    return image
+      .png({ compressionLevel: 9 })
+      .toBuffer();
+  }
+
+  return image
+    .jpeg({
+      quality: 92,
+      chromaSubsampling: '4:4:4',
+      mozjpeg: true,
+    })
     .toBuffer();
 }
 

@@ -365,6 +365,7 @@ function mapRawRowToMeeting(row = {}) {
   const nombreMeeting = getRowValue(row, ['nombreMeeting', 'Nombre del meeting']);
   const asignadaA = getRowValue(row, ['asignadaA', 'Asignada a']);
   const linkComentarios = getRowValue(row, ['linkComentarios', 'Link / Comentarios']);
+  const rowBackground = getRowValue(row, ['rowBackground', 'rowColor', '_rowBackground']);
   const timeRange = parseTimeRange(horaMexico);
 
   return {
@@ -376,6 +377,8 @@ function mapRawRowToMeeting(row = {}) {
     asignadaA,
     personasAsignadas: parseAssignedPeople(asignadaA),
     linkComentarios,
+    rowBackground,
+    rowBackgrounds: Array.isArray(row.rowBackgrounds) ? row.rowBackgrounds : [],
     start: timeRange ? timeRange.start : null,
     end: timeRange ? timeRange.end : null,
   };
@@ -639,6 +642,8 @@ module.exports = {
   parseAssignedPeople,
   parsePeopleQuery,
   parseTimeRange,
+  expandAvailabilityPeople,
+  getSchedulingPeopleForMeeting,
   getSpanishSheetName,
   mapRawRowToMeeting,
   getAgendaByDate,
