@@ -73,6 +73,12 @@ const PEOPLE_ALIASES = {
       'mari',
     ],
   },
+  cielo: {
+    standardName: 'Cielo',
+    aliases: [
+      'cielo',
+    ],
+  },
   nestor: {
     standardName: 'Nestor',
     aliases: [

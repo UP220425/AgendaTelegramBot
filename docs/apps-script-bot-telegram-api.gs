@@ -437,6 +437,18 @@ function botApiApplyMeetingRowFormat(sheet, rowNumber, backgroundColor) {
 function botApiGetMeetingRowColor(payload) {
   var color = String(payload.rowColor || payload.color || '').trim().toLowerCase();
 
+  if (
+    color === 'strong_red' ||
+    color === 'strongred' ||
+    color === 'red_strong' ||
+    color === 'rojo fuerte' ||
+    color === 'rojo intenso' ||
+    color === 'urgencia' ||
+    color === 'urgente'
+  ) {
+    return '#ff0000';
+  }
+
   if (color === 'green' || color === 'verde') {
     return '#b6d7a8';
   }
@@ -449,7 +461,8 @@ function botApiGetMeetingRowColor(payload) {
 }
 
 function botApiGetStartMinutes(value) {
-  var startText = String(value || '').split(/\s*[-–—]\s*/)[0] || '';
+  var startMatch = String(value || '').match(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/i);
+  var startText = startMatch ? startMatch[0] : '';
   var twelveHourMatch = startText.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
 
   if (twelveHourMatch) {

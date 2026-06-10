@@ -18,6 +18,7 @@ const {
   getConflicts,
   getAvailability,
   getTodayMeetingsForPerson,
+  normalizeClientName,
   normalizePersonName,
   parseAssignedPeople,
   parsePeopleQuery,
@@ -106,6 +107,7 @@ const AVAILABLE_PEOPLE = [
   { id: 'jacel', name: 'Jacel' },
   { id: 'ivan', name: 'Ivan' },
   { id: 'mariana', name: 'Mariana' },
+  { id: 'cielo', name: 'Cielo' },
   { id: 'nestor', name: 'Nestor' },
   { id: 'rodrigo', name: 'Rodrigo' },
   { id: 'paulina', name: 'Paulina' },
@@ -173,12 +175,16 @@ const ADD_MEETING_COLORS = {
     value: 'white',
   },
   green: {
-    label: 'Verde claro',
+    label: 'Verde',
     value: 'green',
   },
   red: {
     label: 'Rojo claro',
     value: 'red',
+  },
+  strongRed: {
+    label: 'Rojo fuerte',
+    value: 'strong_red',
   },
 };
 
@@ -765,10 +771,11 @@ function addMeetingColorKeyboard() {
   return Markup.inlineKeyboard([
     [
       Markup.button.callback('Blanco', 'agregar_color:white'),
-      Markup.button.callback('Verde claro', 'agregar_color:green'),
+      Markup.button.callback('Verde', 'agregar_color:green'),
     ],
     [
       Markup.button.callback('Rojo claro', 'agregar_color:red'),
+      Markup.button.callback('Rojo fuerte', 'agregar_color:strong_red'),
     ],
     [
       Markup.button.callback('Cancelar alta', 'agregar_cancelar'),
@@ -963,9 +970,10 @@ function getAddMeetingPrompt(step) {
     [ADD_MEETING_STEPS.COLOR]: [
       'Elige el color de la fila.',
       '',
-      'Blanco: reunión normal',
-      'Verde claro: tentativa o seguimiento especial',
-      'Rojo claro: importante o con atención',
+      'Blanco: clientes Sra. Lety o cualquier otra junta',
+      'Verde: cliente de Pau',
+      'Rojo claro: cliente de Yess',
+      'Rojo fuerte: urgencia',
     ].join('\n'),
   };
 
@@ -1166,6 +1174,36 @@ function getMeetingPeopleForNotifications(meeting) {
   return expandAvailabilityPeople(assignedPeople);
 }
 
+function getRegisteredPersonRecipients() {
+  const recipientsByChatId = new Map();
+
+  getAllUserProfiles()
+    .filter((profile) => profile.chatId && profile.personName)
+    .forEach((profile) => {
+      recipientsByChatId.set(String(profile.chatId), profile);
+    });
+
+  getActiveSubscribers()
+    .filter((subscriber) => subscriber.chatId && subscriber.personName)
+    .filter((subscriber) => !subscriber.chatType || subscriber.chatType === 'private')
+    .forEach((subscriber) => {
+      const key = String(subscriber.chatId);
+
+      if (!recipientsByChatId.has(key)) {
+        recipientsByChatId.set(key, subscriber);
+      }
+    });
+
+  return [...recipientsByChatId.values()];
+}
+
+function getNotificationRecipientsForPeople(targetPeople = []) {
+  const normalizedTargets = new Set(targetPeople.map(normalizePersonName).filter(Boolean));
+
+  return getRegisteredPersonRecipients()
+    .filter((recipient) => normalizedTargets.has(normalizePersonName(recipient.personName)));
+}
+
 function formatMeetingChangeNotification(meeting, actionLabel) {
   const lines = [
     actionLabel,
@@ -1197,12 +1235,15 @@ async function notifyRegisteredPeopleForMeeting(ctx, meeting, type) {
     ? 'Se dio de baja una reunión de tu agenda.'
     : 'Se agregó una reunión a tu agenda.';
   const message = formatMeetingChangeNotification(meeting, actionLabel);
-  const profiles = getAllUserProfiles()
-    .filter((profile) => profile.chatId && profile.personName)
-    .filter((profile) => targetPeople.includes(normalizePersonName(profile.personName)));
+  const recipients = getNotificationRecipientsForPeople(targetPeople);
   let sentCount = 0;
 
-  for (const profile of profiles) {
+  if (!recipients.length) {
+    console.log(`No encontré chats registrados para notificar a: ${targetPeople.join(', ')}`);
+    return 0;
+  }
+
+  for (const profile of recipients) {
     try {
       await bot.telegram.sendMessage(profile.chatId, message);
       sentCount += 1;
@@ -1494,7 +1535,7 @@ async function handleAddMeetingText(ctx) {
       return ctx.reply('Escribe el cliente o área.', addMeetingCancelKeyboard());
     }
 
-    flow.data.cliente = text;
+    flow.data.cliente = normalizeClientName(text);
     flow.step = ADD_MEETING_STEPS.NAME;
     return ctx.reply(getAddMeetingPrompt(flow.step), addMeetingCancelKeyboard());
   }
@@ -1542,6 +1583,12 @@ async function handleAddMeetingText(ctx) {
       rojo: ADD_MEETING_COLORS.red.value,
       'rojo claro': ADD_MEETING_COLORS.red.value,
       red: ADD_MEETING_COLORS.red.value,
+      'rojo fuerte': ADD_MEETING_COLORS.strongRed.value,
+      'rojo intenso': ADD_MEETING_COLORS.strongRed.value,
+      urgencia: ADD_MEETING_COLORS.strongRed.value,
+      urgente: ADD_MEETING_COLORS.strongRed.value,
+      strong_red: ADD_MEETING_COLORS.strongRed.value,
+      strongred: ADD_MEETING_COLORS.strongRed.value,
     };
 
     return setAddMeetingColor(ctx, colorByText[cleaned] || ADD_MEETING_COLORS.white.value);
@@ -1816,9 +1863,17 @@ function formatAssignedPeople(meeting) {
     : 'Sin asignar';
 }
 
+function formatMeetingTimeDisplay(meeting) {
+  if (meeting.start && meeting.end) {
+    return `${meeting.start} - ${meeting.end}`;
+  }
+
+  return meeting.horaMexico || '??:?? - ??:??';
+}
+
 function formatMeetingBlock(meeting) {
   return [
-    `${meeting.start || '??:??'} - ${meeting.end || '??:??'}`,
+    formatMeetingTimeDisplay(meeting),
     `Cliente: ${meeting.cliente || 'Sin cliente'}`,
     `Reunión: ${meeting.nombreMeeting || 'Sin nombre'}`,
     `Asignados: ${formatAssignedPeople(meeting)}`,
@@ -1827,7 +1882,7 @@ function formatMeetingBlock(meeting) {
 
 function formatMeetingShortBlock(meeting) {
   return [
-    `${meeting.start || '??:??'} - ${meeting.end || '??:??'}`,
+    formatMeetingTimeDisplay(meeting),
     `Cliente: ${meeting.cliente || 'Sin cliente'}`,
     `Reunión: ${meeting.nombreMeeting || 'Sin nombre'}`,
   ].join('\n');
@@ -2235,8 +2290,7 @@ async function sendUpcomingMeetingReminders() {
     return;
   }
 
-  const profiles = getAllUserProfiles()
-    .filter((profile) => profile.chatId && profile.personName);
+  const profiles = getRegisteredPersonRecipients();
 
   if (!profiles.length) {
     return;
@@ -2869,7 +2923,7 @@ bot.action('agregar_sin_link', async (ctx) => {
   await answerCallback(ctx);
   return finishAddMeetingWithoutLink(ctx);
 });
-bot.action(/^agregar_color:(white|green|red)$/, async (ctx) => {
+bot.action(/^agregar_color:(white|green|red|strong_red)$/, async (ctx) => {
   await answerCallback(ctx);
   return setAddMeetingColor(ctx, ctx.match[1]);
 });

@@ -35,6 +35,11 @@ const WORKDAY_END = '18:00';
 const SOURCE_MOCK = 'mock';
 const SOURCE_GOOGLE_SHEETS = 'google_sheets';
 const SYSTEMS_GROUP_NAME = 'Sistemas';
+const CLIENT_NAME_ALIASES = {
+  ch: 'Cielito Home',
+  'c h': 'Cielito Home',
+  'cielito home': 'Cielito Home',
+};
 
 const MOCK_RAW_MEETINGS = [
   {
@@ -128,6 +133,17 @@ function toReadableName(value) {
     .split(' ')
     .map((word) => `${word.charAt(0).toUpperCase()}${word.slice(1)}`)
     .join(' ');
+}
+
+function normalizeClientName(value) {
+  const rawValue = String(value || '').trim();
+  const cleanedValue = cleanText(rawValue);
+
+  if (!cleanedValue) {
+    return '';
+  }
+
+  return CLIENT_NAME_ALIASES[cleanedValue] || rawValue;
 }
 
 function getAliasEntries() {
@@ -281,7 +297,10 @@ function parsePeopleQuery(value) {
 }
 
 function parseSingleTime(value) {
-  const timeText = String(value || '').trim();
+  const timeText = String(value || '')
+    .trim()
+    .replace(/[.,;]+$/g, '')
+    .replace(/\s+/g, ' ');
   const twelveHourMatch = timeText.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
 
   if (twelveHourMatch) {
@@ -321,7 +340,31 @@ function parseSingleTime(value) {
 }
 
 function parseTimeRange(value) {
-  const parts = String(value || '').split(/\s*[-–—]\s*/);
+  const text = String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ');
+  const timeMatches = text.match(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi) || [];
+
+  if (timeMatches.length >= 2) {
+    const normalizedMatches = timeMatches.slice(0, 2);
+    const hasPeriod = (timeText) => /\b(?:am|pm)\b/i.test(timeText);
+
+    if (!hasPeriod(normalizedMatches[0]) && hasPeriod(normalizedMatches[1])) {
+      normalizedMatches[0] = `${normalizedMatches[0]} ${normalizedMatches[1].match(/\b(?:am|pm)\b/i)[0]}`;
+    }
+
+    const start = parseSingleTime(normalizedMatches[0]);
+    const end = parseSingleTime(normalizedMatches[1]);
+
+    if (start && end) {
+      return {
+        start,
+        end,
+      };
+    }
+  }
+
+  const parts = text.split(/\s*(?:[-–—]|\.|\ba\b|\bal\b|\bhasta\b)\s*/i);
 
   if (parts.length !== 2) {
     return null;
@@ -361,7 +404,7 @@ function mapRawRowToMeeting(row = {}) {
   const rowNumber = Number(getRowValue(row, ['rowNumber', 'Row Number', '_rowNumber']));
   const fecha = getRowValue(row, ['fecha', 'Fecha']);
   const horaMexico = getRowValue(row, ['horaMexico', 'Hora Mexico']);
-  const cliente = getRowValue(row, ['cliente', 'Cliente']);
+  const cliente = normalizeClientName(getRowValue(row, ['cliente', 'Cliente']));
   const nombreMeeting = getRowValue(row, ['nombreMeeting', 'Nombre del meeting']);
   const asignadaA = getRowValue(row, ['asignadaA', 'Asignada a']);
   const linkComentarios = getRowValue(row, ['linkComentarios', 'Link / Comentarios']);
@@ -638,6 +681,7 @@ async function getAvailability(date = dayjs(), people = []) {
 module.exports = {
   MOCK_RAW_MEETINGS,
   cleanText,
+  normalizeClientName,
   normalizePersonName,
   parseAssignedPeople,
   parsePeopleQuery,
