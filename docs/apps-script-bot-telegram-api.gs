@@ -61,6 +61,10 @@ function doPost(e) {
       return botApiJsonResponse(botApiDeleteMeeting(body.payload || {}));
     }
 
+    if (body.action === 'SORT_AGENDA_BY_DATE') {
+      return botApiJsonResponse(botApiSortAgendaByDate(body.payload || {}));
+    }
+
     return botApiJsonResponse({
       ok: false,
       error: 'UNKNOWN_ACTION',
@@ -135,6 +139,40 @@ function botApiGetAgendaByDate(payload) {
     source: 'google_sheets',
     sheetName: sheetName,
     rows: rows,
+  };
+}
+
+function botApiSortAgendaByDate(payload) {
+  var date = botApiParseIsoDate(payload.date);
+
+  if (!date) {
+    return {
+      ok: false,
+      error: 'INVALID_DATE',
+    };
+  }
+
+  var spreadsheet = botApiGetSpreadsheet();
+  var sheetName = botApiGetSheetName(date);
+  var sheet = spreadsheet.getSheetByName(sheetName);
+
+  if (!sheet) {
+    return {
+      ok: false,
+      error: 'SHEET_NOT_FOUND',
+      sheetName: sheetName,
+    };
+  }
+
+  var timezone = Session.getScriptTimeZone() || 'America/Mexico_City';
+  var dateText = Utilities.formatDate(date, timezone, 'dd-MM-yyyy');
+
+  botApiNormalizeMeetingRows(sheet, dateText);
+
+  return {
+    ok: true,
+    source: 'google_sheets',
+    sheetName: sheetName,
   };
 }
 

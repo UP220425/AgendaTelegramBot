@@ -100,9 +100,16 @@ async function deleteMeetingRow(meeting) {
   return result.row || null;
 }
 
+async function sortAgendaRowsByDate(date) {
+  return callAppsScript('SORT_AGENDA_BY_DATE', {
+    date: getIsoDateKey(date),
+  });
+}
+
 module.exports = {
   callAppsScript,
   getAgendaRowsByDate,
   addMeetingRow,
   deleteMeetingRow,
+  sortAgendaRowsByDate,
 };

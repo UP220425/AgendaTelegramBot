@@ -30,7 +30,7 @@ const {
   isPersonInMeeting,
   timeToMinutes,
 } = require('./services/agendaService');
-const { addMeetingRow, deleteMeetingRow } = require('./services/appsScriptService');
+const { addMeetingRow, deleteMeetingRow, sortAgendaRowsByDate } = require('./services/appsScriptService');
 const { createAgendaImageBuffer } = require('./services/agendaImageService');
 const {
   getUserProfile,
@@ -93,6 +93,7 @@ const helpMessage = [
   '- /empalmes manana: revisar conflictos del día siguiente',
   '- /agregar: iniciar alta de una nueva reunión',
   '- /baja: dar de baja una reunión',
+  '- /ordenaragenda: ordenar la agenda por hora',
   '- /resumenhoy: generar imagen de agenda de hoy',
   '- /resumenmanana: probar el resumen automático del día siguiente',
 ].join('\n');
@@ -318,6 +319,7 @@ function mainMenuKeyboard() {
     ],
     [
       Markup.button.callback('Dar de baja reunión', 'baja_reunion'),
+      Markup.button.callback('Ordenar agenda', 'ordenar_agenda'),
     ],
     [
       Markup.button.callback('Ayuda', 'ayuda'),
@@ -345,6 +347,12 @@ function getUserAvailabilitySelection(ctx) {
   }
 
   return availabilitySelections.get(userId);
+}
+
+function clearUserAvailabilitySelection(ctx) {
+  const selectedPeople = getUserAvailabilitySelection(ctx);
+  selectedPeople.clear();
+  return selectedPeople;
 }
 
 function setUserAvailabilityTarget(ctx, target) {
@@ -431,8 +439,13 @@ function dateChoiceKeyboard(callbackPrefix) {
   ]);
 }
 
-function getPeopleButtons(selectedPeople = new Set()) {
+function getPeopleButtons(selectedPeople = new Set(), target = buildDateTarget('today'), profile = null) {
   const peopleRows = [];
+  const todayLabel = target.mode === 'today' ? '[x] Hoy' : 'Hoy';
+  const nextLabel = target.mode === 'next' ? '[x] Día siguiente' : 'Día siguiente';
+  const profileLabel = profile
+    ? `Usar mi nombre (${profile.personName})`
+    : 'Usar mi nombre';
 
   for (let index = 0; index < AVAILABLE_PEOPLE.length; index += 2) {
     const rowPeople = AVAILABLE_PEOPLE.slice(index, index + 2);
@@ -447,6 +460,13 @@ function getPeopleButtons(selectedPeople = new Set()) {
   }
 
   return [
+    [
+      Markup.button.callback(todayLabel, 'disponibilidad_fecha:today'),
+      Markup.button.callback(nextLabel, 'disponibilidad_fecha:next'),
+    ],
+    [
+      Markup.button.callback(profileLabel, 'disponibilidad_mi_nombre'),
+    ],
     ...peopleRows,
     [
       Markup.button.callback('Consultar disponibilidad', 'disponibilidad_consultar'),
@@ -561,6 +581,14 @@ function showDeleteMeetingDateMenu(ctx) {
   );
 }
 
+function showSortAgendaDateMenu(ctx) {
+  return showDateChoiceMenu(
+    ctx,
+    '¿Qué agenda quieres ordenar por hora?',
+    'ordenar_fecha'
+  );
+}
+
 function isMessageNotModifiedError(error) {
   return String(error?.description || error?.message || '')
     .toLowerCase()
@@ -573,7 +601,7 @@ function showAvailabilityMenu(
   target = getUserAvailabilityTarget(ctx)
 ) {
   const message = formatAvailabilityMenuMessage(selectedPeople, target);
-  const keyboard = Markup.inlineKeyboard(getPeopleButtons(selectedPeople));
+  const keyboard = Markup.inlineKeyboard(getPeopleButtons(selectedPeople, target, getCurrentProfile(ctx)));
 
   if (ctx.callbackQuery) {
     return ctx.editMessageText(message, keyboard)
@@ -2226,6 +2254,33 @@ async function replyAvailability(ctx, people, target = buildDateTarget('today'))
   return replyWithMenuButton(ctx, formatAvailabilityResponse(availability, people, target));
 }
 
+async function replySortAgenda(ctx, target = buildDateTarget('today')) {
+  try {
+    const result = await sortAgendaRowsByDate(target.date);
+    const response = [
+      'Agenda ordenada por hora correctamente.',
+      '',
+      `Fecha: ${target.label}`,
+    ];
+
+    if (result.sheetName) {
+      response.push(`Pestaña: ${result.sheetName}`);
+    }
+
+    return replyWithMenuButton(ctx, response.join('\n'));
+  } catch (error) {
+    const safeErrorMessage = getSafeErrorMessage(error);
+    console.error('No se pudo ordenar la agenda en Apps Script:', safeErrorMessage);
+
+    return replyWithMenuButton(ctx, [
+      'No pude ordenar la agenda en Google Sheets.',
+      `Detalle: ${safeErrorMessage}`,
+      '',
+      'Revisa que Apps Script tenga la acción SORT_AGENDA_BY_DATE desplegada y vuelve a intentar.',
+    ].join('\n'));
+  }
+}
+
 function replyHelp(ctx) {
   return replyWithMenuButton(ctx, helpMessage);
 }
@@ -2798,7 +2853,7 @@ bot.command('disponibilidad', (ctx) => {
 
   if (!requestedPeople.length) {
     setUserAvailabilityTarget(ctx, target);
-    return showAvailabilityMenu(ctx, getUserAvailabilitySelection(ctx), target);
+    return showAvailabilityMenu(ctx, clearUserAvailabilitySelection(ctx), target);
   }
 
   return replyAvailability(ctx, requestedPeople, target);
@@ -2813,6 +2868,12 @@ bot.command(['baja', 'bajar'], (ctx) => {
   return startDeleteMeetingFlow(ctx, target);
 });
 
+bot.command(['ordenar', 'ordenaragenda'], (ctx) => {
+  const command = ctx.message.text.split(/\s+/)[0].replace('/', '').split('@')[0];
+  const { target } = extractDateTarget(getCommandArgs(ctx, command));
+  return replySortAgenda(ctx, target);
+});
+
 bot.action('agenda_hoy', (ctx) => handleAction(ctx, replyTodayAgenda));
 bot.action('agenda_manana', (ctx) => handleAction(ctx, replyTomorrowAgenda));
 bot.action('mis_juntas_hoy', (ctx) => handleAction(ctx, replyMyTodayAgenda));
@@ -2820,11 +2881,20 @@ bot.action('configurar_persona', (ctx) => handleAction(ctx, showProfileMenu));
 bot.action('siguiente_reunion', (ctx) => handleAction(ctx, showNextMeetingMenu));
 bot.action('siguiente_jefa_lety', (ctx) => handleAction(ctx, (context) => replyNextMeeting(context, 'Sra Lety')));
 bot.action('siguiente_jefa_yess', (ctx) => handleAction(ctx, (context) => replyNextMeeting(context, 'Yess')));
-bot.action('disponibilidad_menu', (ctx) => handleAction(ctx, showAvailabilityDateMenu));
-bot.action('disponibilidad', (ctx) => handleAction(ctx, showAvailabilityDateMenu));
+bot.action('disponibilidad_menu', async (ctx) => {
+  await answerCallback(ctx);
+  clearUserAvailabilitySelection(ctx);
+  return showAvailabilityDateMenu(ctx);
+});
+bot.action('disponibilidad', async (ctx) => {
+  await answerCallback(ctx);
+  clearUserAvailabilitySelection(ctx);
+  return showAvailabilityDateMenu(ctx);
+});
 bot.action('empalmes', (ctx) => handleAction(ctx, showConflictsDateMenu));
 bot.action('agregar_reunion', (ctx) => handleAction(ctx, replyAddMeeting));
 bot.action('baja_reunion', (ctx) => handleAction(ctx, showDeleteMeetingDateMenu));
+bot.action('ordenar_agenda', (ctx) => handleAction(ctx, showSortAgendaDateMenu));
 bot.action('ayuda', (ctx) => handleAction(ctx, replyHelp));
 bot.action(/^siguiente_persona:(.+)$/, async (ctx) => {
   await answerCallback(ctx);
@@ -2870,6 +2940,10 @@ bot.action(/^empalmes_fecha:(today|next)$/, async (ctx) => {
 bot.action(/^baja_fecha:(today|next)$/, async (ctx) => {
   await answerCallback(ctx);
   return startDeleteMeetingFlow(ctx, buildDateTarget(ctx.match[1]));
+});
+bot.action(/^ordenar_fecha:(today|next)$/, async (ctx) => {
+  await answerCallback(ctx);
+  return replySortAgenda(ctx, buildDateTarget(ctx.match[1]));
 });
 bot.action(/^baja_select:(\d+)$/, async (ctx) => {
   await answerCallback(ctx);
@@ -2947,10 +3021,24 @@ bot.action(/^disponibilidad_toggle:(.+)$/, async (ctx) => {
 
   return showAvailabilityMenu(ctx, selectedPeople);
 });
+bot.action('disponibilidad_mi_nombre', async (ctx) => {
+  await answerCallback(ctx);
+
+  const profile = getCurrentProfile(ctx);
+
+  if (!profile) {
+    await ctx.reply('Primero necesito saber quién eres para usar tu nombre.');
+    return showProfileMenu(ctx);
+  }
+
+  const selectedPeople = clearUserAvailabilitySelection(ctx);
+  selectedPeople.add(profile.personName);
+
+  return showAvailabilityMenu(ctx, selectedPeople, getUserAvailabilityTarget(ctx));
+});
 bot.action('disponibilidad_limpiar', async (ctx) => {
   await answerCallback(ctx);
-  const selectedPeople = getUserAvailabilitySelection(ctx);
-  selectedPeople.clear();
+  const selectedPeople = clearUserAvailabilitySelection(ctx);
   return showAvailabilityMenu(ctx, selectedPeople);
 });
 bot.action('disponibilidad_consultar', async (ctx) => {
