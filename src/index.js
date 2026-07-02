@@ -61,6 +61,7 @@ const execFileAsync = promisify(execFile);
 let isBotRunning = false;
 let isCheckingReminders = false;
 let isSendingDailyAgendaDigest = false;
+let isSendingManualAgendaBroadcast = false;
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error('Error: TELEGRAM_BOT_TOKEN no está definido en el archivo .env.');
@@ -81,7 +82,7 @@ const mainMenuMessage = [
   'Selecciona una opción:',
 ].join('\n');
 
-const helpMessage = [
+const helpLines = [
   '- /hoy: consultar agenda de hoy',
   '- /misjuntas: consultar mis juntas de hoy',
   '- /soy: configurar quién soy',
@@ -96,7 +97,7 @@ const helpMessage = [
   '- /ordenaragenda: ordenar la agenda por hora',
   '- /resumenhoy: generar imagen de agenda de hoy',
   '- /resumenmanana: probar el resumen automático del día siguiente',
-].join('\n');
+];
 
 const AVAILABLE_PEOPLE = [
   { id: 'sistemas', name: 'Sistemas' },
@@ -121,6 +122,14 @@ const AVAILABLE_PEOPLE = [
   { id: 'luis_vega', name: 'Luis Vega' },
   { id: 'eric', name: 'Eric' },
 ];
+
+const MANUAL_AGENDA_BROADCAST_ADMINS = new Set([
+  'Carlos',
+  'Paulina',
+  'Lety',
+  'Yess',
+  'Lenin',
+]);
 
 const SPANISH_DAYS = [
   'Domingo',
@@ -295,8 +304,25 @@ function extractDateTarget(text = '') {
   };
 }
 
-function mainMenuKeyboard() {
-  return Markup.inlineKeyboard([
+function canSendManualAgendaBroadcast(ctx) {
+  const profile = getCurrentProfile(ctx);
+  const personName = normalizePersonName(profile?.personName || '');
+
+  return MANUAL_AGENDA_BROADCAST_ADMINS.has(personName);
+}
+
+function getHelpMessage(ctx) {
+  const lines = [...helpLines];
+
+  if (canSendManualAgendaBroadcast(ctx)) {
+    lines.push('- /mandaragenda: enviar agenda de hoy en foto a todos');
+  }
+
+  return lines.join('\n');
+}
+
+function mainMenuKeyboard(ctx) {
+  const rows = [
     [
       Markup.button.callback('Agenda de hoy', 'agenda_hoy'),
       Markup.button.callback('Agenda día siguiente', 'agenda_manana'),
@@ -321,10 +347,21 @@ function mainMenuKeyboard() {
       Markup.button.callback('Dar de baja reunión', 'baja_reunion'),
       Markup.button.callback('Ordenar agenda', 'ordenar_agenda'),
     ],
+  ];
+
+  if (canSendManualAgendaBroadcast(ctx)) {
+    rows.push([
+      Markup.button.callback('Enviar Agenda Actualizada', 'broadcast_agenda_hoy'),
+    ]);
+  }
+
+  rows.push(
     [
       Markup.button.callback('Ayuda', 'ayuda'),
     ],
-  ]);
+  );
+
+  return Markup.inlineKeyboard(rows);
 }
 
 function backToMenuKeyboard() {
@@ -581,6 +618,48 @@ function showDeleteMeetingDateMenu(ctx) {
   );
 }
 
+function manualAgendaBroadcastConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('Enviar Agenda Actualizada', 'broadcast_agenda_hoy_confirm'),
+    ],
+    [
+      Markup.button.callback('Volver al menú', 'menu_principal'),
+    ],
+  ]);
+}
+
+function showManualAgendaBroadcastConfirm(ctx) {
+  if (!canSendManualAgendaBroadcast(ctx)) {
+    return replyWithMenuButton(ctx, [
+      'No tienes habilitada esta función.',
+      'Pídele a Carlos, Paulina, Sra Lety, Yess o Lenin que la envíe.',
+    ].join('\n'));
+  }
+
+  const subscribers = getUniqueActiveSubscribers();
+  const message = [
+    'Enviar agenda de hoy a todos',
+    '',
+    `Se enviará la imagen de agenda de hoy a ${subscribers.length} chat(s) activo(s).`,
+    '',
+    'Confirma solo si quieres enviarla ahora.',
+  ].join('\n');
+
+  if (ctx.callbackQuery) {
+    return ctx.editMessageText(message, manualAgendaBroadcastConfirmKeyboard())
+      .catch((error) => {
+        if (isMessageNotModifiedError(error)) {
+          return undefined;
+        }
+
+        return ctx.reply(message, manualAgendaBroadcastConfirmKeyboard());
+      });
+  }
+
+  return ctx.reply(message, manualAgendaBroadcastConfirmKeyboard());
+}
+
 function showSortAgendaDateMenu(ctx) {
   return showDateChoiceMenu(
     ctx,
@@ -620,19 +699,20 @@ function showAvailabilityMenu(
 async function showMainMenu(ctx) {
   clearAddMeetingFlow(ctx);
   clearDeleteMeetingFlow(ctx);
+  const keyboard = mainMenuKeyboard(ctx);
 
   if (ctx.callbackQuery) {
-    return ctx.editMessageText(mainMenuMessage, mainMenuKeyboard())
+    return ctx.editMessageText(mainMenuMessage, keyboard)
       .catch((error) => {
         if (isMessageNotModifiedError(error)) {
           return undefined;
         }
 
-        return ctx.reply(mainMenuMessage, mainMenuKeyboard());
+        return ctx.reply(mainMenuMessage, keyboard);
       });
   }
 
-  return ctx.reply(mainMenuMessage, mainMenuKeyboard());
+  return ctx.reply(mainMenuMessage, keyboard);
 }
 
 async function answerCallback(ctx) {
@@ -644,7 +724,7 @@ async function answerCallback(ctx) {
 }
 
 function getUserId(ctx) {
-  return ctx.from?.id;
+  return ctx?.from?.id;
 }
 
 function getChatId(ctx) {
@@ -1223,6 +1303,18 @@ function getRegisteredPersonRecipients() {
     });
 
   return [...recipientsByChatId.values()];
+}
+
+function getUniqueActiveSubscribers() {
+  const subscribersByChatId = new Map();
+
+  getActiveSubscribers()
+    .filter((subscriber) => subscriber.chatId)
+    .forEach((subscriber) => {
+      subscribersByChatId.set(String(subscriber.chatId), subscriber);
+    });
+
+  return [...subscribersByChatId.values()];
 }
 
 function getNotificationRecipientsForPeople(targetPeople = []) {
@@ -2282,7 +2374,7 @@ async function replySortAgenda(ctx, target = buildDateTarget('today')) {
 }
 
 function replyHelp(ctx) {
-  return replyWithMenuButton(ctx, helpMessage);
+  return replyWithMenuButton(ctx, getHelpMessage(ctx));
 }
 
 function replyAddMeeting(ctx) {
@@ -2641,17 +2733,8 @@ function formatAgendaDigestCaption(digest) {
   return `Agenda ${formatLongSpanishDate(digest.target.date)}`;
 }
 
-async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
-  let image;
+async function sendAgendaDigestToChatWithImage(chatId, digest, image, extra = {}) {
   const caption = formatAgendaDigestCaption(digest);
-
-  try {
-    image = await writeAgendaImageFile(digest);
-  } catch (error) {
-    console.error('No pude generar imagen de agenda; enviando texto:', getSafeErrorMessage(error));
-    await sendLongTelegramMessage(chatId, digest.message, extra);
-    return;
-  }
 
   try {
     await sendAgendaPhotoWithRetry(chatId, image, caption);
@@ -2679,6 +2762,20 @@ async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
   }
 }
 
+async function sendAgendaDigestToChat(chatId, digest, extra = {}) {
+  let image;
+
+  try {
+    image = await writeAgendaImageFile(digest);
+  } catch (error) {
+    console.error('No pude generar imagen de agenda; enviando texto:', getSafeErrorMessage(error));
+    await sendLongTelegramMessage(chatId, digest.message, extra);
+    return;
+  }
+
+  return sendAgendaDigestToChatWithImage(chatId, digest, image, extra);
+}
+
 async function replyAgendaDigest(ctx, buildDigest) {
   const chatId = getChatId(ctx);
 
@@ -2699,6 +2796,134 @@ async function replyTodayAgendaDigest(ctx) {
 
 async function replyTomorrowAgendaDigest(ctx) {
   return replyAgendaDigest(ctx, buildTomorrowAgendaDigest);
+}
+
+function formatManualAgendaBroadcastReport(result) {
+  return [
+    'Envío manual de agenda terminado.',
+    '',
+    `Agenda: ${result.targetLabel}`,
+    `Enviados: ${result.sentCount}`,
+    `Fallidos: ${result.failedCount}`,
+  ].join('\n');
+}
+
+async function sendManualTodayAgendaBroadcast() {
+  if (isSendingManualAgendaBroadcast) {
+    return {
+      inProgress: true,
+      sentCount: 0,
+      failedCount: 0,
+      targetLabel: 'agenda de hoy',
+    };
+  }
+
+  const subscribers = getUniqueActiveSubscribers();
+
+  if (!subscribers.length) {
+    return {
+      inProgress: false,
+      sentCount: 0,
+      failedCount: 0,
+      targetLabel: 'agenda de hoy',
+    };
+  }
+
+  isSendingManualAgendaBroadcast = true;
+
+  try {
+    const digest = await buildTodayAgendaDigest({ silent: true });
+    let image = null;
+    let sentCount = 0;
+    let failedCount = 0;
+
+    try {
+      image = await writeAgendaImageFile(digest);
+    } catch (error) {
+      console.error('No pude generar imagen para envío manual; enviaré texto:', getSafeErrorMessage(error));
+    }
+
+    for (const subscriber of subscribers) {
+      try {
+        if (image) {
+          await sendAgendaDigestToChatWithImage(subscriber.chatId, digest, image);
+        } else {
+          await sendLongTelegramMessage(subscriber.chatId, digest.message);
+        }
+
+        sentCount += 1;
+        await wait(250);
+      } catch (error) {
+        failedCount += 1;
+        console.error('No pude enviar agenda manual a un chat:', getSafeErrorMessage(error));
+
+        if (shouldDeactivateSubscriber(error)) {
+          deactivateSubscriber(subscriber.chatId, getSafeErrorMessage(error));
+        }
+      }
+    }
+
+    console.log(`Agenda manual enviada a ${sentCount} chat(s). Fallidos: ${failedCount}.`);
+
+    return {
+      inProgress: false,
+      sentCount,
+      failedCount,
+      targetLabel: formatLongSpanishDate(digest.target.date),
+    };
+  } finally {
+    isSendingManualAgendaBroadcast = false;
+  }
+}
+
+async function replyManualTodayAgendaBroadcast(ctx) {
+  if (!canSendManualAgendaBroadcast(ctx)) {
+    return replyWithMenuButton(ctx, [
+      'No tienes habilitada esta función.',
+      'Pídele a Carlos, Paulina, Sra Lety, Yess o Lenin que la envíe.',
+    ].join('\n'));
+  }
+
+  if (isSendingManualAgendaBroadcast) {
+    return replyWithMenuButton(ctx, 'Ya hay un envío manual de agenda en proceso. Espera tantito y vuelve a intentar.');
+  }
+
+  const subscribers = getUniqueActiveSubscribers();
+
+  if (!subscribers.length) {
+    return replyWithMenuButton(ctx, 'No encontré chats activos para enviar la agenda.');
+  }
+
+  const requesterChatId = getChatId(ctx);
+
+  await ctx.reply(`Voy a enviar la agenda de hoy en foto a ${subscribers.length} chat(s). Te aviso cuando termine.`);
+
+  sendManualTodayAgendaBroadcast()
+    .then((result) => {
+      if (result.inProgress) {
+        return bot.telegram.sendMessage(
+          requesterChatId,
+          'Ya había un envío manual en proceso.',
+          backToMenuKeyboard()
+        );
+      }
+
+      return bot.telegram.sendMessage(
+        requesterChatId,
+        formatManualAgendaBroadcastReport(result),
+        backToMenuKeyboard()
+      );
+    })
+    .catch((error) => {
+      console.error('Error en envío manual de agenda:', getSafeErrorMessage(error));
+      return bot.telegram.sendMessage(
+        requesterChatId,
+        `No pude completar el envío manual de agenda. Detalle: ${getSafeErrorMessage(error)}`,
+        backToMenuKeyboard()
+      ).catch(() => {});
+    });
+
+  return undefined;
 }
 
 async function sendDailyAgendaDigest() {
@@ -2874,6 +3099,10 @@ bot.command(['ordenar', 'ordenaragenda'], (ctx) => {
   return replySortAgenda(ctx, target);
 });
 
+bot.command(['mandaragenda', 'enviaragenda'], (ctx) => {
+  return showManualAgendaBroadcastConfirm(ctx);
+});
+
 bot.action('agenda_hoy', (ctx) => handleAction(ctx, replyTodayAgenda));
 bot.action('agenda_manana', (ctx) => handleAction(ctx, replyTomorrowAgenda));
 bot.action('mis_juntas_hoy', (ctx) => handleAction(ctx, replyMyTodayAgenda));
@@ -2895,6 +3124,8 @@ bot.action('empalmes', (ctx) => handleAction(ctx, showConflictsDateMenu));
 bot.action('agregar_reunion', (ctx) => handleAction(ctx, replyAddMeeting));
 bot.action('baja_reunion', (ctx) => handleAction(ctx, showDeleteMeetingDateMenu));
 bot.action('ordenar_agenda', (ctx) => handleAction(ctx, showSortAgendaDateMenu));
+bot.action('broadcast_agenda_hoy', (ctx) => handleAction(ctx, showManualAgendaBroadcastConfirm));
+bot.action('broadcast_agenda_hoy_confirm', (ctx) => handleAction(ctx, replyManualTodayAgendaBroadcast));
 bot.action('ayuda', (ctx) => handleAction(ctx, replyHelp));
 bot.action(/^siguiente_persona:(.+)$/, async (ctx) => {
   await answerCallback(ctx);
