@@ -73,15 +73,12 @@ Cuando se da de baja una persona:
 - se desactiva su contraseña
 - deja de recibir recordatorios por perfil
 
-## Importante para despliegues
+## Importante para despliegues y Git
 
-Las claves reales y hashes viven en `data/`, y `data/` no se sube a Git por seguridad.
+El archivo con hashes `data/personPasswords.json` se puede subir al repo privado para que el bot funcione en otra computadora despues de hacer `git pull`.
 
-Si el bot se mueve a otra computadora o servidor, hay que copiar de forma privada:
+El archivo `data/claves-usuarios-telegram.txt` tiene contraseñas en texto claro. Ese archivo no debe subirse a Git ni mandarse a grupos.
 
-```text
-data/personPasswords.json
-data/peopleDirectory.json, si existe
-```
+Otros archivos como `data/subscribers.json`, `data/userProfiles.json`, `data/authorizedUsers.json`, `data/sentReminders.json` e imagenes generadas se quedan fuera del repo porque contienen datos locales o informacion de chats.
 
-No compartas esos archivos en grupos.
+Si el bot se mueve a otra computadora, basta con hacer `git pull` para recibir `data/personPasswords.json`.
