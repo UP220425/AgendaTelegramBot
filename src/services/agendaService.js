@@ -117,7 +117,7 @@ function cleanText(value) {
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\./g, '')
+    .replace(/\./g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -300,6 +300,7 @@ function parseSingleTime(value) {
   const timeText = String(value || '')
     .trim()
     .replace(/[.,;]+$/g, '')
+    .replace(/\s*:\s*/g, ':')
     .replace(/\s+/g, ' ');
   const twelveHourMatch = timeText.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
 
@@ -342,7 +343,22 @@ function parseSingleTime(value) {
 function parseTimeRange(value) {
   const text = String(value || '')
     .trim()
+    .replace(/\s*:\s*/g, ':')
     .replace(/\s+/g, ' ');
+  const cleanedText = cleanText(text);
+
+  if (
+    cleanedText === 'todo el dia'
+    || cleanedText === 'todo dia'
+    || cleanedText === 'all day'
+  ) {
+    return {
+      start: WORKDAY_START,
+      end: WORKDAY_END,
+      isAllDay: true,
+    };
+  }
+
   const timeMatches = text.match(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi) || [];
 
   if (timeMatches.length >= 2) {
@@ -360,6 +376,7 @@ function parseTimeRange(value) {
       return {
         start,
         end,
+        isAllDay: false,
       };
     }
   }
@@ -380,6 +397,7 @@ function parseTimeRange(value) {
   return {
     start,
     end,
+    isAllDay: false,
   };
 }
 
@@ -401,7 +419,8 @@ function getRowValue(row, keys) {
 }
 
 function mapRawRowToMeeting(row = {}) {
-  const rowNumber = Number(getRowValue(row, ['rowNumber', 'Row Number', '_rowNumber']));
+  const rawRowNumber = getRowValue(row, ['rowNumber', 'Row Number', '_rowNumber']);
+  const rowNumber = Number(rawRowNumber);
   const fecha = getRowValue(row, ['fecha', 'Fecha']);
   const horaMexico = getRowValue(row, ['horaMexico', 'Hora Mexico']);
   const cliente = normalizeClientName(getRowValue(row, ['cliente', 'Cliente']));
@@ -412,7 +431,7 @@ function mapRawRowToMeeting(row = {}) {
   const timeRange = parseTimeRange(horaMexico);
 
   return {
-    rowNumber: Number.isFinite(rowNumber) ? rowNumber : null,
+    rowNumber: Number.isFinite(rowNumber) && rowNumber > 0 ? rowNumber : null,
     fecha,
     horaMexico,
     cliente,
@@ -424,6 +443,7 @@ function mapRawRowToMeeting(row = {}) {
     rowBackgrounds: Array.isArray(row.rowBackgrounds) ? row.rowBackgrounds : [],
     start: timeRange ? timeRange.start : null,
     end: timeRange ? timeRange.end : null,
+    isAllDay: timeRange ? Boolean(timeRange.isAllDay) : false,
   };
 }
 

@@ -36,6 +36,7 @@ const {
   getUserProfile,
   setUserProfile,
   getAllUserProfiles,
+  deleteUserProfile,
 } = require('./services/userProfileService');
 const {
   upsertSubscriber,
@@ -44,6 +45,31 @@ const {
   markDailyDigestSent,
   deactivateSubscriber,
 } = require('./services/subscriberService');
+const {
+  isAccessPasswordConfigured,
+  isBootstrapPasswordConfigured,
+  isBootstrapPasswordValid,
+  getAuthorizedUser,
+  isUserAuthorized,
+  isUserRevoked,
+  authorizeUser,
+  clearAuthorizedUser,
+  revokeAuthorizedUser,
+} = require('./services/authService');
+const {
+  getActivePeople,
+  findPerson,
+  isActivePersonName,
+  addPerson,
+  deactivatePerson,
+} = require('./services/peopleDirectoryService');
+const {
+  hasAnyPersonPassword,
+  hasPasswordForPerson,
+  verifyPersonPassword,
+  setPersonPassword,
+  removePersonPassword,
+} = require('./services/personPasswordService');
 
 const BOT_NAME = 'Agenda Coordinación Bot';
 const SOURCE_NOTE = 'Fuente: datos de prueba.';
@@ -73,7 +99,6 @@ const AGENDA_IMAGE_FORMAT = 'jpeg';
 const AGENDA_IMAGE_EXTENSION = 'jpg';
 const TELEGRAM_UPLOAD_TIMEOUT_MS = 12000;
 const TELEGRAM_UPLOAD_CURL_TIMEOUT_SECONDS = Math.ceil(TELEGRAM_UPLOAD_TIMEOUT_MS / 1000);
-const REMINDER_GRACE_MINUTES = 1;
 
 const mainMenuMessage = [
   'Hola, soy Agenda Coordinación Bot.',
@@ -99,36 +124,16 @@ const helpLines = [
   '- /resumenmanana: probar el resumen automático del día siguiente',
 ];
 
-const AVAILABLE_PEOPLE = [
-  { id: 'sistemas', name: 'Sistemas' },
-  { id: 'carlos', name: 'Carlos' },
-  { id: 'carlos_alberto', name: 'Carlos 2' },
-  { id: 'leti', name: 'Lety' },
-  { id: 'yess', name: 'Yess' },
-  { id: 'citlali', name: 'Citlali' },
-  { id: 'jacel', name: 'Jacel' },
-  { id: 'ivan', name: 'Ivan' },
-  { id: 'mariana', name: 'Mariana' },
-  { id: 'cielo', name: 'Cielo' },
-  { id: 'nestor', name: 'Nestor' },
-  { id: 'rodrigo', name: 'Rodrigo' },
-  { id: 'paulina', name: 'Paulina' },
-  { id: 'diego', name: 'Diego' },
-  { id: 'brandon', name: 'Brandon' },
-  { id: 'erika', name: 'Erika' },
-  { id: 'lenin', name: 'Lenin' },
-  { id: 'jonathan', name: 'Jonathan' },
-  { id: 'luis_gallo', name: 'Luis Gallo' },
-  { id: 'luis_vega', name: 'Luis Vega' },
-  { id: 'eric', name: 'Eric' },
-];
-
 const MANUAL_AGENDA_BROADCAST_ADMINS = new Set([
   'Carlos',
   'Paulina',
   'Lety',
   'Yess',
   'Lenin',
+]);
+const PEOPLE_MANAGEMENT_ADMINS = new Set([
+  'Carlos',
+  'Diego',
 ]);
 
 const SPANISH_DAYS = [
@@ -160,9 +165,9 @@ const availabilitySelections = new Map();
 const availabilityDateSelections = new Map();
 const addMeetingFlows = new Map();
 const deleteMeetingFlows = new Map();
+const peopleManagementFlows = new Map();
 const sentReminderKeys = loadSentReminderKeys();
 const reminderMinutesBefore = Number(REMINDER_MINUTES_BEFORE) || 15;
-const reminderMinimumMinutesBefore = Math.max(reminderMinutesBefore - REMINDER_GRACE_MINUTES, 0);
 const dailyAgendaDigestTime = parseDailyDigestTime(DAILY_AGENDA_DIGEST_TIME);
 
 const ADD_MEETING_STEPS = {
@@ -311,11 +316,25 @@ function canSendManualAgendaBroadcast(ctx) {
   return MANUAL_AGENDA_BROADCAST_ADMINS.has(personName);
 }
 
+function canManagePeople(ctx) {
+  const profile = getCurrentProfile(ctx);
+  const personName = normalizePersonName(profile?.personName || '');
+
+  return PEOPLE_MANAGEMENT_ADMINS.has(personName);
+}
+
 function getHelpMessage(ctx) {
   const lines = [...helpLines];
 
   if (canSendManualAgendaBroadcast(ctx)) {
     lines.push('- /mandaragenda: enviar agenda de hoy en foto a todos');
+  }
+
+  if (canManagePeople(ctx)) {
+    lines.push('- /personas: gestionar personas activas');
+    lines.push('- /agregarpersona Nombre: agregar persona');
+    lines.push('- /bajapersona Nombre: dar de baja persona');
+    lines.push('- /clavepersona Nombre | contraseña: cambiar contraseña de una persona');
   }
 
   return lines.join('\n');
@@ -326,6 +345,10 @@ function mainMenuKeyboard(ctx) {
     [
       Markup.button.callback('Agenda de hoy', 'agenda_hoy'),
       Markup.button.callback('Agenda día siguiente', 'agenda_manana'),
+    ],
+    [
+      Markup.button.callback('Resumen hoy', 'resumen_hoy'),
+      Markup.button.callback('Resumen mañana', 'resumen_manana'),
     ],
     [
       Markup.button.callback('Mis juntas de hoy', 'mis_juntas_hoy'),
@@ -352,6 +375,12 @@ function mainMenuKeyboard(ctx) {
   if (canSendManualAgendaBroadcast(ctx)) {
     rows.push([
       Markup.button.callback('Enviar Agenda Actualizada', 'broadcast_agenda_hoy'),
+    ]);
+  }
+
+  if (canManagePeople(ctx)) {
+    rows.push([
+      Markup.button.callback('Gestionar personas', 'personas_menu'),
     ]);
   }
 
@@ -419,7 +448,7 @@ function getUserAvailabilityTarget(ctx) {
 }
 
 function getPersonById(personId) {
-  return AVAILABLE_PEOPLE.find((person) => person.id === personId);
+  return getActivePeople({ includeSystems: true }).find((person) => person.id === personId);
 }
 
 function canConsultAvailability(selectedPeople) {
@@ -427,7 +456,7 @@ function canConsultAvailability(selectedPeople) {
 }
 
 function getNextMeetingPeople() {
-  return AVAILABLE_PEOPLE.filter((person) => person.name !== 'Sistemas');
+  return getActivePeople({ includeSystems: false });
 }
 
 function getNextMeetingButtons() {
@@ -484,8 +513,10 @@ function getPeopleButtons(selectedPeople = new Set(), target = buildDateTarget('
     ? `Usar mi nombre (${profile.personName})`
     : 'Usar mi nombre';
 
-  for (let index = 0; index < AVAILABLE_PEOPLE.length; index += 2) {
-    const rowPeople = AVAILABLE_PEOPLE.slice(index, index + 2);
+  const people = getActivePeople({ includeSystems: true });
+
+  for (let index = 0; index < people.length; index += 2) {
+    const rowPeople = people.slice(index, index + 2);
     peopleRows.push(rowPeople.map((person) => {
       const isSelected = selectedPeople.has(person.name);
       const marker = isSelected ? '[x]' : '[ ]';
@@ -699,6 +730,7 @@ function showAvailabilityMenu(
 async function showMainMenu(ctx) {
   clearAddMeetingFlow(ctx);
   clearDeleteMeetingFlow(ctx);
+  clearPeopleManagementFlow(ctx);
   const keyboard = mainMenuKeyboard(ctx);
 
   if (ctx.callbackQuery) {
@@ -733,7 +765,16 @@ function getChatId(ctx) {
 
 function getProfilePersonByName(personName) {
   const normalizedName = normalizePersonName(personName);
-  return getNextMeetingPeople().find((person) => person.name === normalizedName);
+  const person = findPerson(normalizedName);
+
+  if (!person || !person.isActive || person.isSystem) {
+    return null;
+  }
+
+  return {
+    id: person.id,
+    name: person.standardName,
+  };
 }
 
 function saveUserProfile(ctx, personName) {
@@ -751,6 +792,50 @@ function formatProfileResponse(profile) {
     `Listo. Te tengo registrado como ${profile.personName}.`,
     '',
     'Con esto puedo mostrar tus juntas y enviarte recordatorios de reuniones próximas.',
+  ].join('\n');
+}
+
+function isPersonPasswordModeActive() {
+  return hasAnyPersonPassword();
+}
+
+function isBootstrapAccessModeActive() {
+  return !isPersonPasswordModeActive() && isBootstrapPasswordConfigured();
+}
+
+function isSamePersonName(firstPerson, secondPerson) {
+  return normalizePersonName(firstPerson || '') === normalizePersonName(secondPerson || '');
+}
+
+function getAuthorizedPersonName(ctx) {
+  return getAuthorizedUser(getUserId(ctx))?.personName || '';
+}
+
+function isAuthorizedAsCurrentProfile(ctx) {
+  const profile = getCurrentProfile(ctx);
+  const authorizedPersonName = getAuthorizedPersonName(ctx);
+
+  return Boolean(profile && authorizedPersonName && isSamePersonName(profile.personName, authorizedPersonName));
+}
+
+function formatAccessPrompt(profile = null) {
+  if (!profile) {
+    return [
+      'Este bot es privado.',
+      '',
+      'Primero dime quién eres con:',
+      '/soy Tu Nombre',
+      '',
+      'Ejemplo:',
+      '/soy Carlos',
+    ].join('\n');
+  }
+
+  return [
+    `Te tengo como ${profile.personName}.`,
+    '',
+    'Ahora escribe tu contraseña:',
+    '/clave TU_CONTRASEÑA',
   ].join('\n');
 }
 
@@ -783,6 +868,345 @@ function clearDeleteMeetingFlow(ctx) {
   if (userId) {
     deleteMeetingFlows.delete(userId);
   }
+}
+
+function getActivePeopleManagementFlow(ctx) {
+  const userId = getUserId(ctx);
+  return userId ? peopleManagementFlows.get(userId) : null;
+}
+
+function clearPeopleManagementFlow(ctx) {
+  const userId = getUserId(ctx);
+
+  if (userId) {
+    peopleManagementFlows.delete(userId);
+  }
+}
+
+function requirePeopleAdmin(ctx) {
+  if (canManagePeople(ctx)) {
+    return true;
+  }
+
+  replyWithMenuButton(ctx, [
+    'No tienes permisos para gestionar personas.',
+    'Esta función solo está habilitada para Carlos y Diego.',
+  ].join('\n'));
+
+  return false;
+}
+
+function peopleManagementKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('Ver personas activas', 'personas_lista'),
+    ],
+    [
+      Markup.button.callback('Cambiar contraseña', 'personas_clave'),
+    ],
+    [
+      Markup.button.callback('Agregar persona', 'personas_agregar'),
+      Markup.button.callback('Dar de baja persona', 'personas_baja'),
+    ],
+    [
+      Markup.button.callback('Volver al menú', 'menu_principal'),
+    ],
+  ]);
+}
+
+function formatPeopleList() {
+  const people = getActivePeople({ includeSystems: false });
+
+  return [
+    'Personas activas:',
+    '',
+    ...people.map((person) => {
+      const passwordStatus = hasPasswordForPerson(person.name) ? 'con contraseña' : 'sin contraseña';
+      return `- ${person.name} (${passwordStatus})`;
+    }),
+  ].join('\n');
+}
+
+function showPeopleManagementMenu(ctx) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  const message = [
+    'Gestión de personas',
+    '',
+    'Puedes agregar nuevos ingresos o dar de baja personas para que dejen de aparecer en el bot.',
+  ].join('\n');
+
+  if (ctx.callbackQuery) {
+    return ctx.editMessageText(message, peopleManagementKeyboard())
+      .catch((error) => {
+        if (isMessageNotModifiedError(error)) {
+          return undefined;
+        }
+
+        return ctx.reply(message, peopleManagementKeyboard());
+      });
+  }
+
+  return ctx.reply(message, peopleManagementKeyboard());
+}
+
+function showPeopleList(ctx) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  return replyWithMenuButton(ctx, formatPeopleList());
+}
+
+function startAddPersonFlow(ctx) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  const userId = getUserId(ctx);
+
+  if (userId) {
+    peopleManagementFlows.set(userId, { step: 'add_person' });
+  }
+
+  return ctx.reply([
+    'Escribe el nombre de la persona que quieres agregar.',
+    '',
+    'Ejemplo:',
+    'Ulises',
+    '',
+    'También puedes escribir cancelar.',
+  ].join('\n'), backToMenuKeyboard());
+}
+
+function getDeactivatePersonKeyboard() {
+  const rows = [];
+  const people = getActivePeople({ includeSystems: false });
+
+  for (let index = 0; index < people.length; index += 2) {
+    rows.push(people.slice(index, index + 2).map((person) => (
+      Markup.button.callback(person.name, `persona_baja:${person.id}`)
+    )));
+  }
+
+  rows.push([
+    Markup.button.callback('Volver al menú', 'menu_principal'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function showDeactivatePersonMenu(ctx) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  return sendOrEdit(
+    ctx,
+    'Selecciona la persona que quieres dar de baja:',
+    getDeactivatePersonKeyboard()
+  );
+}
+
+function deactivatePersonConfirmKeyboard(personId) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('Confirmar baja', `persona_baja_confirm:${personId}`),
+    ],
+    [
+      Markup.button.callback('Cancelar', 'personas_menu'),
+      Markup.button.callback('Volver al menú', 'menu_principal'),
+    ],
+  ]);
+}
+
+function getSetPersonPasswordKeyboard() {
+  const rows = [];
+  const people = getActivePeople({ includeSystems: false });
+
+  for (let index = 0; index < people.length; index += 2) {
+    rows.push(people.slice(index, index + 2).map((person) => (
+      Markup.button.callback(person.name, `persona_clave:${person.id}`)
+    )));
+  }
+
+  rows.push([
+    Markup.button.callback('Volver al menú', 'menu_principal'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function showSetPersonPasswordMenu(ctx) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  return sendOrEdit(
+    ctx,
+    'Selecciona la persona a la que quieres cambiarle la contraseña:',
+    getSetPersonPasswordKeyboard()
+  );
+}
+
+function startSetPersonPasswordFlow(ctx, personName) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  const person = getProfilePersonByName(personName);
+
+  if (!person) {
+    return replyWithMenuButton(ctx, 'No encontré esa persona activa.');
+  }
+
+  const userId = getUserId(ctx);
+
+  if (userId) {
+    peopleManagementFlows.set(userId, {
+      step: 'set_person_password',
+      personName: person.name,
+    });
+  }
+
+  return ctx.reply([
+    `Escribe la nueva contraseña para ${person.name}.`,
+    '',
+    'Debe tener mínimo 4 caracteres.',
+    'También puedes escribir cancelar.',
+  ].join('\n'), backToMenuKeyboard());
+}
+
+function setPersonPasswordFromText(ctx, personName, password) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  try {
+    const record = setPersonPassword(personName, password);
+    const refreshedCount = clearAccessForPerson(record.personName);
+    clearPeopleManagementFlow(ctx);
+
+    return replyWithMenuButton(ctx, [
+      `Contraseña actualizada para ${record.personName}.`,
+      `Sesiones reiniciadas: ${refreshedCount}`,
+      '',
+      'Esa persona ya podrá entrar con /soy y /clave.',
+    ].join('\n'));
+  } catch (error) {
+    if (error.message === 'PASSWORD_TOO_SHORT') {
+      return ctx.reply('La contraseña debe tener mínimo 4 caracteres. Intenta de nuevo.', backToMenuKeyboard());
+    }
+
+    return replyWithMenuButton(ctx, 'No pude guardar la contraseña. Revisa la persona e intenta de nuevo.');
+  }
+}
+
+function parsePersonPasswordArgs(rawText = '') {
+  const parts = String(rawText || '').split('|');
+
+  if (parts.length < 2) {
+    return {
+      personName: '',
+      password: '',
+    };
+  }
+
+  return {
+    personName: parts[0].trim(),
+    password: parts.slice(1).join('|').trim(),
+  };
+}
+
+function revokeAccessForPerson(personName) {
+  const targetPerson = normalizePersonName(personName);
+  let revokedCount = 0;
+
+  getAllUserProfiles().forEach((profile) => {
+    if (normalizePersonName(profile.personName) !== targetPerson) {
+      return;
+    }
+
+    revokeAuthorizedUser(profile.userId, `Persona dada de baja: ${targetPerson}`);
+    deactivateSubscriber(profile.chatId || profile.userId, `Persona dada de baja: ${targetPerson}`);
+    deleteUserProfile(profile.userId);
+    revokedCount += 1;
+  });
+
+  return revokedCount;
+}
+
+function clearAccessForPerson(personName) {
+  const targetPerson = normalizePersonName(personName);
+  let clearedCount = 0;
+
+  getAllUserProfiles().forEach((profile) => {
+    if (normalizePersonName(profile.personName) !== targetPerson) {
+      return;
+    }
+
+    clearAuthorizedUser(profile.userId);
+    clearedCount += 1;
+  });
+
+  return clearedCount;
+}
+
+function addPersonFromText(ctx, name) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  const cleanedName = String(name || '').trim();
+
+  if (!cleanedName) {
+    return startAddPersonFlow(ctx);
+  }
+
+  try {
+    const person = addPerson(cleanedName);
+    const userId = getUserId(ctx);
+
+    if (userId) {
+      peopleManagementFlows.set(userId, {
+        step: 'set_person_password',
+        personName: person.standardName,
+      });
+    }
+
+    return ctx.reply([
+      `Persona agregada: ${person.standardName}`,
+      '',
+      'Ahora escribe la contraseña que usará para entrar al bot.',
+      'Debe tener mínimo 4 caracteres.',
+    ].join('\n'), backToMenuKeyboard());
+  } catch (error) {
+    return replyWithMenuButton(ctx, 'No pude agregar esa persona. Revisa el nombre e intenta de nuevo.');
+  }
+}
+
+function deactivatePersonFromText(ctx, name) {
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  const person = deactivatePerson(name);
+
+  if (!person) {
+    return replyWithMenuButton(ctx, 'No encontré esa persona activa para darla de baja.');
+  }
+
+  const revokedCount = revokeAccessForPerson(person.standardName);
+  removePersonPassword(person.standardName);
+
+  return replyWithMenuButton(ctx, [
+    `Persona dada de baja: ${person.standardName}`,
+    `Accesos revocados: ${revokedCount}`,
+    '',
+    'Ya no aparecerá en los botones ni recibirá recordatorios por perfil.',
+  ].join('\n'));
 }
 
 function addMeetingCancelKeyboard() {
@@ -997,7 +1421,7 @@ function getAddMeetingSelectedPeople(flow) {
 
 function addMeetingPeopleKeyboard(selectedPeople = new Set()) {
   const rows = [];
-  const people = AVAILABLE_PEOPLE;
+  const people = getActivePeople({ includeSystems: true });
 
   for (let index = 0; index < people.length; index += 2) {
     const rowPeople = people.slice(index, index + 2);
@@ -1287,12 +1711,16 @@ function getRegisteredPersonRecipients() {
 
   getAllUserProfiles()
     .filter((profile) => profile.chatId && profile.personName)
+    .filter((profile) => isUserAuthorized(profile.userId))
+    .filter((profile) => isActivePersonName(profile.personName))
     .forEach((profile) => {
       recipientsByChatId.set(String(profile.chatId), profile);
     });
 
   getActiveSubscribers()
     .filter((subscriber) => subscriber.chatId && subscriber.personName)
+    .filter((subscriber) => isUserAuthorized(subscriber.chatId))
+    .filter((subscriber) => isActivePersonName(subscriber.personName))
     .filter((subscriber) => !subscriber.chatType || subscriber.chatType === 'private')
     .forEach((subscriber) => {
       const key = String(subscriber.chatId);
@@ -1310,6 +1738,7 @@ function getUniqueActiveSubscribers() {
 
   getActiveSubscribers()
     .filter((subscriber) => subscriber.chatId)
+    .filter((subscriber) => isUserAuthorized(subscriber.chatId))
     .forEach((subscriber) => {
       subscribersByChatId.set(String(subscriber.chatId), subscriber);
     });
@@ -1712,6 +2141,36 @@ async function handleAddMeetingText(ctx) {
     };
 
     return setAddMeetingColor(ctx, colorByText[cleaned] || ADD_MEETING_COLORS.white.value);
+  }
+
+  return undefined;
+}
+
+function handlePeopleManagementText(ctx) {
+  const flow = getActivePeopleManagementFlow(ctx);
+
+  if (!flow) {
+    return undefined;
+  }
+
+  const text = String(ctx.message?.text || '').trim();
+  const cleaned = text.toLowerCase();
+
+  if (cleaned === 'cancelar') {
+    clearPeopleManagementFlow(ctx);
+    return replyWithMenuButton(ctx, 'Gestión de personas cancelada.');
+  }
+
+  if (text.startsWith('/')) {
+    return ctx.reply('Termina la gestión actual o escribe cancelar.', backToMenuKeyboard());
+  }
+
+  if (flow.step === 'add_person') {
+    return addPersonFromText(ctx, text);
+  }
+
+  if (flow.step === 'set_person_password') {
+    return setPersonPasswordFromText(ctx, flow.personName, text);
   }
 
   return undefined;
@@ -2459,7 +2918,9 @@ async function sendUpcomingMeetingReminders() {
         const minutesUntilStart = startMinutes - nowMinutes;
 
         if (
-          minutesUntilStart < reminderMinimumMinutesBefore
+          meeting.isAllDay
+          || !Number.isFinite(startMinutes)
+          || minutesUntilStart < 0
           || minutesUntilStart > reminderMinutesBefore
         ) {
           continue;
@@ -2476,7 +2937,8 @@ async function sendUpcomingMeetingReminders() {
 
         await bot.telegram.sendMessage(
           profile.chatId,
-          formatReminderMessage(profile, meeting, minutesUntilStart)
+          formatReminderMessage(profile, meeting, minutesUntilStart),
+          backToMenuKeyboard()
         ).catch((error) => {
           console.error(`No pude enviar recordatorio a ${profile.personName}:`, getSafeErrorMessage(error));
         });
@@ -2931,7 +3393,7 @@ async function sendDailyAgendaDigest() {
     return;
   }
 
-  const subscribers = getActiveSubscribers();
+  const subscribers = getUniqueActiveSubscribers();
 
   if (!subscribers.length) {
     return;
@@ -2996,6 +3458,8 @@ function scheduleDailyAgendaDigest() {
 function syncSubscribersFromProfiles() {
   getAllUserProfiles()
     .filter((profile) => profile.chatId)
+    .filter((profile) => isUserAuthorized(profile.userId))
+    .filter((profile) => isActivePersonName(profile.personName))
     .forEach((profile) => {
       upsertSubscriber({
         chatId: profile.chatId,
@@ -3007,13 +3471,171 @@ function syncSubscribersFromProfiles() {
     });
 }
 
-// Comandos principales del MVP local.
-bot.use((ctx, next) => {
+function getMessageText(ctx) {
+  return ctx.message?.text || ctx.callbackQuery?.message?.text || '';
+}
+
+function getCommandNameFromText(text = '') {
+  const match = String(text || '').trim().match(/^\/([a-zA-Z0-9_]+)(?:@\w+)?/);
+  return match ? match[1].toLowerCase() : '';
+}
+
+function getAccessPasswordFromText(text = '') {
+  return String(text || '')
+    .replace(/^\/(?:clave|password|acceso)(?:@\w+)?\s*/i, '')
+    .trim();
+}
+
+function isAccessCommand(ctx) {
+  return ['clave', 'password', 'acceso'].includes(getCommandNameFromText(getMessageText(ctx)));
+}
+
+function isStartCommand(ctx) {
+  return getCommandNameFromText(getMessageText(ctx)) === 'start';
+}
+
+function isProfileSetupCommand(ctx) {
+  return ['soy', 'perfil'].includes(getCommandNameFromText(getMessageText(ctx)));
+}
+
+function isProfileSetupAction(ctx) {
+  const action = ctx.callbackQuery?.data || '';
+  return action === 'configurar_persona' || action.startsWith('perfil_persona:');
+}
+
+function canContinueWithoutProfile(ctx) {
+  const commandName = getCommandNameFromText(getMessageText(ctx));
+  return isStartCommand(ctx)
+    || commandName === 'help'
+    || isProfileSetupCommand(ctx)
+    || isProfileSetupAction(ctx);
+}
+
+function replyAccessPrompt(ctx) {
+  return ctx.reply(formatAccessPrompt(getCurrentProfile(ctx)));
+}
+
+async function handleAccessCommand(ctx) {
+  if (isUserRevoked(getUserId(ctx))) {
+    return ctx.reply('Tu acceso a este bot fue desactivado. Contacta a Carlos o Diego.');
+  }
+
+  const profile = getCurrentProfile(ctx);
+
+  if (!profile) {
+    return replyAccessPrompt(ctx);
+  }
+
+  if (!isPersonPasswordModeActive() && !isBootstrapAccessModeActive()) {
+    return ctx.reply([
+      'Todavía no hay contraseñas configuradas.',
+      'Carlos o Diego pueden agregarlas desde Gestionar personas.',
+    ].join('\n'));
+  }
+
+  const password = getAccessPasswordFromText(getMessageText(ctx));
+
+  const isBootstrapAllowed = isBootstrapAccessModeActive()
+    && PEOPLE_MANAGEMENT_ADMINS.has(normalizePersonName(profile.personName))
+    && isBootstrapPasswordValid(password);
+  const isPersonPasswordValid = isPersonPasswordModeActive()
+    && verifyPersonPassword(profile.personName, password);
+
+  if (!isBootstrapAllowed && !isPersonPasswordValid) {
+    if (isPersonPasswordModeActive() && !hasPasswordForPerson(profile.personName)) {
+      return ctx.reply('Tu usuario todavía no tiene contraseña configurada. Contacta a Carlos o Diego.');
+    }
+
+    return ctx.reply('Contraseña incorrecta. Intenta de nuevo con /clave TU_CONTRASEÑA.');
+  }
+
+  authorizeUser(ctx, profile.personName);
   upsertSubscriberFromContext(ctx);
-  return next();
-});
+
+  await ctx.reply('Acceso autorizado.');
+
+  return showMainMenu(ctx);
+}
+
+async function enforcePrivateAccess(ctx, next) {
+  const profile = getCurrentProfile(ctx);
+
+  if (profile && !isActivePersonName(profile.personName)) {
+    revokeAuthorizedUser(profile.userId, `Perfil inactivo: ${profile.personName}`);
+    deactivateSubscriber(profile.chatId || profile.userId, `Perfil inactivo: ${profile.personName}`);
+    deleteUserProfile(profile.userId);
+
+    if (ctx.callbackQuery) {
+      await answerCallback(ctx);
+    }
+
+    return ctx.reply('Tu acceso a este bot fue desactivado. Contacta a Carlos o Diego.');
+  }
+
+  if (!isAccessPasswordConfigured()) {
+    upsertSubscriberFromContext(ctx);
+    return next();
+  }
+
+  if (isUserRevoked(getUserId(ctx))) {
+    if (ctx.callbackQuery) {
+      await answerCallback(ctx);
+    }
+
+    return ctx.reply('Tu acceso a este bot fue desactivado. Contacta a Carlos o Diego.');
+  }
+
+  if (isUserAuthorized(getUserId(ctx))) {
+    upsertSubscriberFromContext(ctx);
+
+    if (getCurrentProfile(ctx) && !isAuthorizedAsCurrentProfile(ctx)) {
+      clearAuthorizedUser(getUserId(ctx));
+
+      if (ctx.callbackQuery) {
+        await answerCallback(ctx);
+      }
+
+      return replyAccessPrompt(ctx);
+    }
+
+    if (!getCurrentProfile(ctx) && !canContinueWithoutProfile(ctx)) {
+      if (ctx.callbackQuery) {
+        await answerCallback(ctx);
+      }
+
+      return showProfileMenu(ctx);
+    }
+
+    return next();
+  }
+
+  if (isAccessCommand(ctx)) {
+    return handleAccessCommand(ctx);
+  }
+
+  if (canContinueWithoutProfile(ctx)) {
+    return next();
+  }
+
+  if (ctx.callbackQuery) {
+    await answerCallback(ctx);
+  }
+
+  if (isStartCommand(ctx)) {
+    return replyAccessPrompt(ctx);
+  }
+
+  return ctx.reply('Necesitas autorizarte primero. Escribe /clave TU_CONTRASEÑA.');
+}
+
+// Comandos principales del MVP local.
+bot.use(enforcePrivateAccess);
 
 bot.start((ctx) => {
+  if (isAccessPasswordConfigured() && !isUserAuthorized(getUserId(ctx))) {
+    return replyAccessPrompt(ctx);
+  }
+
   return showMainMenu(ctx);
 });
 
@@ -3033,13 +3655,31 @@ bot.command(['soy', 'perfil'], (ctx) => {
   const requestedPerson = getCommandArgs(ctx, ctx.message.text.split(/\s+/)[0].replace('/', ''));
 
   if (!requestedPerson) {
+    if (isAccessPasswordConfigured() && !isUserAuthorized(getUserId(ctx))) {
+      return replyAccessPrompt(ctx);
+    }
+
     return showProfileMenu(ctx);
   }
 
   const profile = saveUserProfile(ctx, requestedPerson);
 
   if (!profile) {
+    if (isAccessPasswordConfigured() && !isUserAuthorized(getUserId(ctx))) {
+      return ctx.reply('No reconocí esa persona. Revisa el nombre o contacta a Carlos/Diego.');
+    }
+
     return ctx.reply('No reconocí esa persona. Selecciona una opción:', Markup.inlineKeyboard(getProfileButtons()));
+  }
+
+  const authorizedPersonName = getAuthorizedPersonName(ctx);
+
+  if (
+    isAccessPasswordConfigured()
+    && (!isUserAuthorized(getUserId(ctx)) || !isSamePersonName(profile.personName, authorizedPersonName))
+  ) {
+    clearAuthorizedUser(getUserId(ctx));
+    return ctx.reply(formatAccessPrompt(profile));
   }
 
   return replyWithMenuButton(ctx, formatProfileResponse(profile));
@@ -3103,8 +3743,32 @@ bot.command(['mandaragenda', 'enviaragenda'], (ctx) => {
   return showManualAgendaBroadcastConfirm(ctx);
 });
 
+bot.command('personas', (ctx) => {
+  return showPeopleManagementMenu(ctx);
+});
+
+bot.command('agregarpersona', (ctx) => {
+  return addPersonFromText(ctx, getCommandArgs(ctx, 'agregarpersona'));
+});
+
+bot.command('bajapersona', (ctx) => {
+  return deactivatePersonFromText(ctx, getCommandArgs(ctx, 'bajapersona'));
+});
+
+bot.command('clavepersona', (ctx) => {
+  const { personName, password } = parsePersonPasswordArgs(getCommandArgs(ctx, 'clavepersona'));
+
+  if (!personName || !password) {
+    return showSetPersonPasswordMenu(ctx);
+  }
+
+  return setPersonPasswordFromText(ctx, personName, password);
+});
+
 bot.action('agenda_hoy', (ctx) => handleAction(ctx, replyTodayAgenda));
 bot.action('agenda_manana', (ctx) => handleAction(ctx, replyTomorrowAgenda));
+bot.action('resumen_hoy', (ctx) => handleAction(ctx, replyTodayAgendaDigest));
+bot.action('resumen_manana', (ctx) => handleAction(ctx, replyTomorrowAgendaDigest));
 bot.action('mis_juntas_hoy', (ctx) => handleAction(ctx, replyMyTodayAgenda));
 bot.action('configurar_persona', (ctx) => handleAction(ctx, showProfileMenu));
 bot.action('siguiente_reunion', (ctx) => handleAction(ctx, showNextMeetingMenu));
@@ -3126,6 +3790,11 @@ bot.action('baja_reunion', (ctx) => handleAction(ctx, showDeleteMeetingDateMenu)
 bot.action('ordenar_agenda', (ctx) => handleAction(ctx, showSortAgendaDateMenu));
 bot.action('broadcast_agenda_hoy', (ctx) => handleAction(ctx, showManualAgendaBroadcastConfirm));
 bot.action('broadcast_agenda_hoy_confirm', (ctx) => handleAction(ctx, replyManualTodayAgendaBroadcast));
+bot.action('personas_menu', (ctx) => handleAction(ctx, showPeopleManagementMenu));
+bot.action('personas_lista', (ctx) => handleAction(ctx, showPeopleList));
+bot.action('personas_agregar', (ctx) => handleAction(ctx, startAddPersonFlow));
+bot.action('personas_baja', (ctx) => handleAction(ctx, showDeactivatePersonMenu));
+bot.action('personas_clave', (ctx) => handleAction(ctx, showSetPersonPasswordMenu));
 bot.action('ayuda', (ctx) => handleAction(ctx, replyHelp));
 bot.action(/^siguiente_persona:(.+)$/, async (ctx) => {
   await answerCallback(ctx);
@@ -3153,8 +3822,68 @@ bot.action(/^perfil_persona:(.+)$/, async (ctx) => {
     return showProfileMenu(ctx);
   }
 
+  const authorizedPersonName = getAuthorizedPersonName(ctx);
+
+  if (
+    isAccessPasswordConfigured()
+    && (!isUserAuthorized(getUserId(ctx)) || !isSamePersonName(profile.personName, authorizedPersonName))
+  ) {
+    clearAuthorizedUser(getUserId(ctx));
+    return ctx.editMessageText(formatAccessPrompt(profile))
+      .catch(() => ctx.reply(formatAccessPrompt(profile)));
+  }
+
   return ctx.editMessageText(formatProfileResponse(profile), backToMenuKeyboard())
     .catch(() => replyWithMenuButton(ctx, formatProfileResponse(profile)));
+});
+bot.action(/^persona_baja:(.+)$/, async (ctx) => {
+  await answerCallback(ctx);
+
+  if (!requirePeopleAdmin(ctx)) {
+    return undefined;
+  }
+
+  const person = getPersonById(ctx.match[1]);
+
+  if (!person || person.name === 'Sistemas') {
+    return showDeactivatePersonMenu(ctx);
+  }
+
+  return ctx.editMessageText(
+    [
+      'Confirma la baja de esta persona:',
+      '',
+      person.name,
+      '',
+      'Se quitará de los botones y se revocará el acceso de perfiles registrados con ese nombre.',
+    ].join('\n'),
+    deactivatePersonConfirmKeyboard(person.id)
+  ).catch(() => ctx.reply(
+    `Confirma la baja de ${person.name}`,
+    deactivatePersonConfirmKeyboard(person.id)
+  ));
+});
+bot.action(/^persona_baja_confirm:(.+)$/, async (ctx) => {
+  await answerCallback(ctx);
+
+  const person = getPersonById(ctx.match[1]);
+
+  if (!person) {
+    return showDeactivatePersonMenu(ctx);
+  }
+
+  return deactivatePersonFromText(ctx, person.name);
+});
+bot.action(/^persona_clave:(.+)$/, async (ctx) => {
+  await answerCallback(ctx);
+
+  const person = getPersonById(ctx.match[1]);
+
+  if (!person || person.name === 'Sistemas') {
+    return showSetPersonPasswordMenu(ctx);
+  }
+
+  return startSetPersonPasswordFlow(ctx, person.name);
 });
 bot.action(/^disponibilidad_fecha:(today|next)$/, async (ctx) => {
   await answerCallback(ctx);
@@ -3305,7 +4034,7 @@ bot.action('menu_principal', async (ctx) => {
   return showMainMenu(ctx);
 });
 
-bot.on('text', (ctx) => handleAddMeetingText(ctx));
+bot.on('text', (ctx) => handlePeopleManagementText(ctx) || handleAddMeetingText(ctx));
 
 // Manejo básico de errores para evitar que el proceso caiga sin registro.
 bot.catch((error, ctx) => {
@@ -3344,6 +4073,13 @@ function stopBot(reason) {
 console.log(`Iniciando ${BOT_NAME} en modo ${NODE_ENV}.`);
 console.log(`Timezone configurado: ${TIMEZONE}.`);
 console.log('Usando polling local para pruebas.');
+if (isPersonPasswordModeActive()) {
+  console.log('Acceso privado activo: contraseñas por usuario.');
+} else if (isBootstrapAccessModeActive()) {
+  console.log('Acceso privado en modo inicial: BOT_ACCESS_PASSWORD solo para configurar claves por usuario.');
+} else {
+  console.warn('Acceso privado no configurado: crea contraseñas por usuario desde Gestionar personas.');
+}
 
 async function startBot() {
   try {

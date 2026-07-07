@@ -28,6 +28,7 @@ const PEOPLE_ALIASES = {
       'sra lety',
       'sra. leti',
       'sra. lety',
+      'sra ley',
       'leti',
       'lety',
       'leticia',
@@ -73,18 +74,29 @@ const PEOPLE_ALIASES = {
       'mari',
     ],
   },
+  sarur: {
+    standardName: 'Sarur',
+    aliases: [
+      'sarur',
+    ],
+  },
+  jose: {
+    standardName: 'Jose',
+    aliases: [
+      'jose',
+      'josé',
+    ],
+  },
   cielo: {
     standardName: 'Cielo',
     aliases: [
       'cielo',
     ],
   },
-  nestor: {
-    standardName: 'Nestor',
+  ulises: {
+    standardName: 'Ulises',
     aliases: [
-      'nestor',
-      'néstor',
-      'nes',
+      'ulises',
     ],
   },
   luisGallo: {
@@ -103,13 +115,6 @@ const PEOPLE_ALIASES = {
       'luis v',
       'luis v.',
       'luis',
-    ],
-  },
-  rodrigo: {
-    standardName: 'Rodrigo',
-    aliases: [
-      'rodrigo',
-      'rodri',
     ],
   },
   pau: {
@@ -171,6 +176,11 @@ const PEOPLE_ALIASES = {
     aliases: [
       'sistemas',
       'sistema',
+      'todos',
+      'todas',
+      'todo el equipo',
+      'equipo',
+      'all',
     ],
   },
 };
