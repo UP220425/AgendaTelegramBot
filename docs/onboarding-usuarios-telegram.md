@@ -82,3 +82,18 @@ El archivo `data/claves-usuarios-telegram.txt` tiene contraseñas en texto claro
 Otros archivos como `data/subscribers.json`, `data/userProfiles.json`, `data/authorizedUsers.json`, `data/sentReminders.json` e imagenes generadas se quedan fuera del repo porque contienen datos locales o informacion de chats.
 
 Si el bot se mueve a otra computadora, basta con hacer `git pull` para recibir `data/personPasswords.json`.
+
+## Si no se manda el resumen de las 5 PM
+
+El resumen automatico solo se envia a chats autorizados.
+
+Si el bot se corre en otra laptop por primera vez, cada usuario debe volver a hacer:
+
+```text
+/soy Nombre
+/clave contraseña
+```
+
+Esto crea el registro local en `data/authorizedUsers.json` y `data/subscribers.json`.
+
+Si la laptop esta apagada, dormida, sin internet, o el proceso `npm run dev` no esta corriendo exactamente a las 5 PM, el resumen no se envia.

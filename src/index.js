@@ -50,6 +50,7 @@ const {
   isBootstrapPasswordConfigured,
   isBootstrapPasswordValid,
   getAuthorizedUser,
+  getActiveAuthorizedUsers,
   isUserAuthorized,
   isUserRevoked,
   authorizeUser,
@@ -761,6 +762,18 @@ function getUserId(ctx) {
 
 function getChatId(ctx) {
   return ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id || getUserId(ctx);
+}
+
+function getChatTitleFromContext(ctx) {
+  const chat = ctx.chat || ctx.callbackQuery?.message?.chat || {};
+
+  if (chat.title) {
+    return chat.title;
+  }
+
+  return [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ')
+    || ctx.from?.username
+    || 'Sin nombre';
 }
 
 function getProfilePersonByName(personName) {
@@ -1741,6 +1754,26 @@ function getUniqueActiveSubscribers() {
     .filter((subscriber) => isUserAuthorized(subscriber.chatId))
     .forEach((subscriber) => {
       subscribersByChatId.set(String(subscriber.chatId), subscriber);
+    });
+
+  getActiveAuthorizedUsers()
+    .filter((user) => user.chatId || user.userId)
+    .filter((user) => !user.personName || isActivePersonName(user.personName))
+    .forEach((user) => {
+      const chatId = user.chatId || user.userId;
+      const key = String(chatId);
+
+      if (subscribersByChatId.has(key)) {
+        return;
+      }
+
+      subscribersByChatId.set(key, {
+        chatId,
+        chatType: user.chatType || 'private',
+        title: [user.firstName, user.lastName].filter(Boolean).join(' ') || user.telegramUsername || user.personName || 'Sin nombre',
+        telegramUsername: user.telegramUsername || '',
+        personName: user.personName || '',
+      });
     });
 
   return [...subscribersByChatId.values()];
@@ -3396,6 +3429,7 @@ async function sendDailyAgendaDigest() {
   const subscribers = getUniqueActiveSubscribers();
 
   if (!subscribers.length) {
+    console.log('Resumen diario no enviado: no hay chats autorizados registrados.');
     return;
   }
 
@@ -3404,17 +3438,28 @@ async function sendDailyAgendaDigest() {
   try {
     const digest = await buildTomorrowAgendaDigest({ silent: true });
     let sentCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
 
     for (const subscriber of subscribers) {
       if (subscriber.lastDailyDigestDate === digest.target.iso) {
+        skippedCount += 1;
         continue;
       }
 
       try {
         await sendAgendaDigestToChat(subscriber.chatId, digest);
+        upsertSubscriber({
+          chatId: subscriber.chatId,
+          chatType: subscriber.chatType || 'private',
+          title: subscriber.title || subscriber.personName || 'Sin nombre',
+          telegramUsername: subscriber.telegramUsername || '',
+          personName: subscriber.personName || '',
+        });
         markDailyDigestSent(subscriber.chatId, digest.target.iso);
         sentCount += 1;
       } catch (error) {
+        failedCount += 1;
         console.error('No pude enviar resumen diario a un chat:', getSafeErrorMessage(error));
 
         if (shouldDeactivateSubscriber(error)) {
@@ -3423,7 +3468,7 @@ async function sendDailyAgendaDigest() {
       }
     }
 
-    console.log(`Resumen diario enviado a ${sentCount} chat(s).`);
+    console.log(`Resumen diario enviado a ${sentCount} chat(s). Omitidos: ${skippedCount}. Fallidos: ${failedCount}.`);
   } finally {
     isSendingDailyAgendaDigest = false;
   }
@@ -3550,7 +3595,13 @@ async function handleAccessCommand(ctx) {
   }
 
   authorizeUser(ctx, profile.personName);
-  upsertSubscriberFromContext(ctx);
+  upsertSubscriber({
+    chatId: getChatId(ctx),
+    chatType: ctx.chat?.type || ctx.callbackQuery?.message?.chat?.type || 'private',
+    title: getChatTitleFromContext(ctx),
+    telegramUsername: ctx.from?.username || '',
+    personName: profile.personName,
+  });
 
   await ctx.reply('Acceso autorizado.');
 

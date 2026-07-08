@@ -49,6 +49,12 @@ function getAuthorizedUser(userId) {
   return readAuthorizedUsers()[String(userId)] || null;
 }
 
+function getActiveAuthorizedUsers() {
+  return Object.values(readAuthorizedUsers())
+    .filter((user) => user && user.isActive !== false)
+    .filter((user) => user.chatId || user.userId);
+}
+
 function isUserAuthorized(userId) {
   if (!isAccessPasswordConfigured()) {
     return true;
@@ -135,6 +141,7 @@ module.exports = {
   isBootstrapPasswordConfigured,
   isBootstrapPasswordValid,
   getAuthorizedUser,
+  getActiveAuthorizedUsers,
   isUserAuthorized,
   isUserRevoked,
   authorizeUser,
